@@ -1,0 +1,308 @@
+name: point_moe_nz_ground
+out_dir: runs
+seed: 1
+num_classes: 2
+in_features_dim: 6
+kernel_sizes:
+- 7
+- 13
+- 15
+first_subsampling_dl: 0.1
+scene_mode: true
+scene_max_points: 600000
+scene_block_size: 64.0
+scene_block_margin: 8.0
+scene_min_points: 100
+scene_cache_tiles: 4
+conv_radius: 2.1
+kp_extent: 1.0
+num_layers: 5
+init_channels: 64
+channel_scaling: 1.41
+use_batch_norm: true
+batch_norm_momentum: 0.1
+norm_type: bn
+num_norm_groups: 8
+dropout: 0.5
+use_simam: true
+use_point_moe_nz: true
+use_kpconvx: true
+kpx_shell_sizes_per_branch:
+- - 1
+  - 14
+- - 1
+  - 14
+  - 28
+- - 1
+  - 14
+  - 28
+  - 42
+kpx_shells:
+- 1
+- 14
+- 28
+kpx_attention_groups: 8
+kpx_mod_grp_norm: true
+kpx_first_attention_layer: 1
+kpx_attention_act: sigmoid
+kpx_influence_mode: linear
+kpx_expansion: 4
+kpx_stem_shells:
+- 1
+- 14
+- 28
+kpx_stem_kernel: 15
+layer_blocks:
+- 3
+- 3
+- 9
+- 12
+- 3
+kpx_layer_widths:
+- 64
+- 96
+- 128
+- 192
+- 256
+drop_path_rate: 0.3
+kpx_grid_pool: true
+share_kp: false
+grid_scaling: 2.2
+head_dropout: 0.0
+feature_knn: 16
+use_mean_elevation: false
+use_curvature: false
+use_higher_moments: false
+use_return_features: true
+use_return_ratio: true
+use_intensity: true
+intensity_log: true
+use_rgb: false
+use_xyz_in_features: true
+use_constant_feature: false
+use_dtm_raster: true
+dtm_patch_size: 64
+dtm_feat_dim: 8
+use_prev_dtm: false
+dtm_resolution: 1.0
+min_dtm_coverage: 0.0
+data_root: data
+tile_size: 50.0
+auto_in_radius: false
+in_radius: 5.0
+sphere_center_spacing: 5.0
+tile_cache_size: 4
+sphere_min_points: 100
+tile_overlap: 5.0
+max_points_per_tile: 400000
+max_train_tiles: 0
+val_fraction: 0.1
+test_fraction: 0.1
+auto_subsampling_dl: false
+min_subsampling_dl: 0.1
+download_budget_gb: 100.0
+download_source: opentopography
+tiles_per_pair: 6
+download_workers: 16
+ot_min_year: 2020
+ot_min_density: 2.0
+ot_max_density: 13.0
+ot_density_sample_tiles: 6
+es_prefix: data/ES/CNIG/Lidar_2015-2021_epsg25829/copc/
+es_prev_prefix: data/ES/CNIG/Lidar_2008-2015_epsg25829/copc/
+es_pairing: cross
+es_epsg: 25829
+es_region_filter: ''
+es_sample_seed: 1234
+regions: []
+use_skew_sampler: false
+class_target_fractions: null
+skew_quota: 0.75
+skew_oversample: 3.0
+use_augmentation: true
+augment_rotation_z: true
+augment_anisotropic: true
+augment_scale_min: 0.8
+augment_scale_max: 1.2
+augment_flip_x: true
+augment_noise: 0.001
+canopy_height_thresh: 2.0
+forest_class5_frac: 0.6
+forest_canopy_frac: 0.5
+urban_building_frac: 0.25
+urban_builtup_frac: 0.15
+slope1_min: 35.0
+slope2_min: 45.0
+mountain_elev: 1000.0
+water_min_pts: 50
+seashore_ground_min: 100
+seashore_elev_lo: -10.0
+seashore_elev_hi: 10.0
+epochs: 450
+epoch_steps: 500
+validation_size: 50
+batch_num: 16
+variable_batch: true
+batch_limit: 0
+neighbor_limit: 20
+neighbor_limits:
+- 12
+- 16
+- 20
+- 20
+- 20
+neighbor_percentile: 98.0
+neighbor_limit_max: 0
+num_workers: 16
+dataloader_persistent: false
+dataloader_prefetch: 2
+gpu_neighbors: false
+gpu_neighbor_qchunk: 4096
+learning_rate: 0.01
+momentum: 0.98
+weight_decay: 0.001
+optimizer: adamw
+adamw_lr: 0.002
+adamw_weight_decay: 0.005
+adamw_betas:
+- 0.9
+- 0.999
+adamw_eps: 1.0e-08
+block_lr_scale: 0.1
+warmup_epochs: 20
+loss_lovasz: false
+lovasz_weight: 1.0
+use_height_aware_loss: true
+hag_lambda: 0.5
+hag_num_bins: 6
+hag_dtm_res: 1.0
+hag_min_ground: 8
+dtm_rmse_res: 1.0
+kpx_lr_start: 0.0001
+kpx_lr_max: 0.005
+kpx_lr_warmup_epochs: 30
+kpx_lr_plateau_epochs: 5
+kpx_lr_decay10_epochs: 120
+lr_decay: 0.9772372
+lr_schedule: cosine
+grad_clip_norm: 100.0
+class_weights: null
+loss_class_balance: none
+amp: true
+amp_dtype: bf16
+save_checkpoint_every_epoch: true
+render_errors_every_epoch: true
+write_laz_every_epoch: true
+n_vis_tiles: 6
+vis_full_area: true
+vis_area_size: 100.0
+moe_order:
+- z
+- z-trans
+- hilbert
+- hilbert-trans
+shuffle_orders: true
+stem_kernel_size: 5
+enc_stride:
+- 2
+- 2
+- 2
+- 2
+enc_depths:
+- 2
+- 2
+- 2
+- 6
+- 2
+enc_channels:
+- 32
+- 64
+- 128
+- 256
+- 512
+enc_num_head:
+- 2
+- 4
+- 8
+- 16
+- 32
+enc_patch_size:
+- 1024
+- 1024
+- 1024
+- 1024
+- 1024
+dec_depths:
+- 2
+- 2
+- 2
+- 2
+dec_channels:
+- 64
+- 64
+- 128
+- 256
+dec_num_head:
+- 4
+- 4
+- 8
+- 16
+dec_patch_size:
+- 1024
+- 1024
+- 1024
+- 1024
+mlp_ratio: 4.0
+use_moe: true
+use_moe_proj: true
+use_moe_mlp: false
+num_experts: 8
+moe_topk: 2
+moe_use_residual: false
+moe_layers: null
+moe_aux_loss_alpha: 0.0
+moe_n_intermediate_size: 2.0
+moe_act_fn: relu
+moe_domain_guided: false
+moe_context_channels: 16
+backbone: point_moe
+litept_lc: 3
+litept_enc_depths:
+- 2
+- 2
+- 2
+- 6
+- 2
+litept_enc_channels:
+- 36
+- 72
+- 144
+- 252
+- 504
+litept_enc_num_head:
+- 2
+- 4
+- 8
+- 14
+- 28
+litept_dec_channels:
+- 72
+- 72
+- 144
+- 252
+litept_rope_freq: 100.0
+litept_decoder_blocks: false
+prior_raster_channels: 5
+prior_raster_gating: true
+dtm_cnn_mid: 32
+scene_block_margin_frac: 0.1
+# SPAG-DC ground-misclassification corrector (post-classification, at inference; see SPAG_DC.md)
+refine_method: spag_dc        # 'spag_dc' (SPAG-DC corrector, IEEE Sensors 2025) | 'off'
+spag_theta0_deg: 10.0         # initial normal-angle threshold (deg); paper value
+spag_alpha: 0.5               # region-growing curvature coeff (gate opens 0.4; recommend 0.5-0.7)
+spag_beta: 0.7                # angle-relaxation coeff in [0,1); recommend 0.6-0.8
+spag_k: 20                    # region-growing kNN (paper ~20-25)
+spag_n_sigma: 3.0             # mu2 + n*sigma2 correction cut (3-sigma normal-tail)
+spag_min_grid_diff: 0.1       # m; min per-grid elevation-difference floor (paper)
+spag_tps_kmin: 10             # TPS adaptive-neighbourhood bounds (paper tested K 10-30)
+spag_tps_kmax: 30

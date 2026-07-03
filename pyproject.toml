@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meepo_nz"
+version = "1.0.0"
+description = "MEEPO for NZ LiDAR ground extraction: a clean-PyTorch reimplementation of MEEPO (PTv3 + sparse Mixture-of-Experts, ICLR 2026) with no spconv / flash-attn / torch_scatter, runnable on Blackwell (sm_120) and CPU."
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "matplotlib>=3.6",
+    "laspy>=2.5",
+    "lazrs>=0.5",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+download = ["boto3>=1.28", "botocore>=1.31", "awscli>=1.29", "requests>=2.31"]
+dtm = ["rasterio>=1.3"]
+
+[tool.setuptools.packages.find]
+include = ["meepo_nz*"]

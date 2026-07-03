@@ -1,0 +1,18 @@
+# Core (CPU/GPU-agnostic) Python dependencies.
+# NOTE: install PyTorch separately with a CUDA build that matches your GPU
+# (see setup.sh — Blackwell needs a CUDA 12.8+ wheel). Do NOT pin torch here.
+numpy>=1.23
+scipy>=1.9
+matplotlib>=3.6
+laspy>=2.5
+lazrs>=0.5
+pyyaml>=6.0
+
+# Data download (scripts/01) — NZ open data on AWS, OpenTopography fallback
+boto3>=1.28
+botocore>=1.31
+awscli>=1.29
+requests>=2.31
+
+# Previous-year DTM mosaicking from LINZ dem_1m GeoTIFFs (scripts/02)
+rasterio>=1.3
