@@ -72,6 +72,7 @@ def main():
     ap.add_argument("--infer-batch", type=int, default=None, help="Spheres per forward pass (default 16; raise on a big GPU).")
     ap.add_argument("--device", default=None)
     ap.add_argument("--tta", action="store_true", help="Test-time augmentation: average softmax over z-rotations 0/90/180/270 (rotates cloud + prior raster).")
+    ap.add_argument("--epsg", type=int, default=2193, help="EPSG stamped on the output when the source LAS has no CRS (e.g. 27700 = British National Grid; source CRS is preferred when present).")
     args = ap.parse_args()
 
     device = torch.device(args.device) if args.device else \
@@ -114,7 +115,7 @@ def main():
         neighbor_limit=args.neighbor_limit, progress=50, intensity=intensity,
         tta=bool(args.tta))
 
-    write_classified(args.out, xyz, pred_full, meta)
+    write_classified(args.out, xyz, pred_full, meta, epsg=int(args.epsg))
     n_ground = int(pred_full.sum())
     print(f"[06] sphere-voted {n:,} points -> ground={n_ground:,} "
           f"({100.0*n_ground/max(n,1):.1f}%)  wrote {args.out}")

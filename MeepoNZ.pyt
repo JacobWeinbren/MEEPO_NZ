@@ -66,7 +66,8 @@ class BuildPriorRaster(object):
 
     def getParameterInfo(self):
         return [
-            _param("input_dir", "Current-year LAS/LAZ folder", "DEFolder"),
+            _param("input_dir", "Current-year LAS/LAZ folder (OR use project tree below)", "DEFolder", required=False),
+            _param("project_dir", "Project tree (subfolders each holding LAS + Previous DTM)", "DEFolder", required=False),
             _param("workspace", "Workspace folder (receives manifest.json + prior/)", "GPString"),
             _param("raster_dir", "Hand-crafted prior raster folder (optional)", "DEFolder", required=False),
             _param("prev_dir", "Previous-year LAS/LAZ folder (optional)", "DEFolder", required=False),
@@ -76,7 +77,13 @@ class BuildPriorRaster(object):
 
     def execute(self, parameters, messages):
         p = {q.name: q.valueAsText for q in parameters}
-        args = ["--input-dir", p["input_dir"], "--root", p["workspace"]]
+        if not p.get("input_dir") and not p.get("project_dir"):
+            raise arcpy.ExecuteError("Provide a LAS/LAZ folder or a project tree folder.")
+        args = ["--root", p["workspace"]]
+        if p.get("project_dir"):
+            args += ["--project-dir", p["project_dir"]]
+        else:
+            args += ["--input-dir", p["input_dir"]]
         if p.get("raster_dir"):
             args += ["--raster-dir", p["raster_dir"]]
         elif p.get("prev_dir"):
@@ -138,6 +145,7 @@ class ClassifyLAZ(object):
             _param("tta", "Test-time augmentation (4x slower, slightly better)", "GPBoolean",
                    required=False, default=False),
             _param("device", "Device (cuda / cpu; optional)", "GPString", required=False),
+            _param("epsg", "Output EPSG if source LAS lacks CRS (27700 = BNG)", "GPLong", required=False, default=27700),
         ]
 
     def execute(self, parameters, messages):
@@ -150,6 +158,8 @@ class ClassifyLAZ(object):
             args += ["--tta"]
         if p.get("device"):
             args += ["--device", p["device"]]
+        if p.get("epsg"):
+            args += ["--epsg", p["epsg"]]
         _run(messages, "06_infer.py", args)
         messages.addMessage("Done. Add the output .laz to a LAS dataset (or drag it into a scene) "
                             "and symbolize by Class Code: 2 = ground, 1 = non-ground.")

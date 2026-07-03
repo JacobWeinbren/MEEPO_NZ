@@ -40,9 +40,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from meepo_nz.utils.config import Config
 from meepo_nz.data.dtm import (MultiRaster, build_prior_raster_from_prev,
-                                    prior_from_raster_file, PRIOR_RASTER_CHANNELS)
+                                    prior_from_raster_file, prior_from_raster_files,
+                                    PRIOR_RASTER_CHANNELS)
 from meepo_nz.utils.laz_io import read_points, GROUND_CLASSES
-from meepo_nz.data.folder_manifest import build_folder_manifest, match_rasters
+from meepo_nz.data.folder_manifest import (build_folder_manifest, build_project_manifest,
+                                           match_rasters, match_rasters_spatial, cloud_bounds)
 
 
 def _save_multiraster(path: str, mr: MultiRaster):
@@ -102,13 +104,17 @@ def _build_one_cloud_prior(task):
 
 
 def _build_one_cloud_prior_from_raster(task):
-    """Build the 5-channel prior from a pre-made (hand-crafted) raster matched to a cloud.
-    Partial coverage is preserved: cells the raster leaves as NoData become coverage=0."""
-    cur_path, raster_path, out_path, res = task
+    """Build the 5-channel prior from the raster(s) spatially matched to a cloud --
+    mosaicked if several, cropped to the cloud's extent (+margin). Partial coverage is
+    preserved: cells the raster leaves as NoData become coverage=0."""
+    cur_path, raster_paths, out_path, res, bounds = task
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return (cur_path, out_path, "exists")
     try:
-        mr = prior_from_raster_file(raster_path, res)
+        if len(raster_paths) == 1 and raster_paths[0].lower().endswith((".npz", ".npy")):
+            mr = prior_from_raster_file(raster_paths[0], res)
+        else:
+            mr = prior_from_raster_files(raster_paths, res, bounds=bounds)
     except Exception as e:
         return (cur_path, None, f"FAILED ({e})")
     if mr is None:
@@ -128,9 +134,18 @@ def main():
                     help="Optional folder of previous-year .las/.laz. Twins matched by identical file "
                          "stem become the prior source; unmatched current clouds get no prior.")
     ap.add_argument("--raster-dir", default=None,
-                    help="Folder of pre-made previous-year rasters (GeoTIFF/ASC/.npz), matched to clouds "
-                         "by file stem. Takes precedence over --prev-dir. NoData / uncovered cells are kept "
-                         "as coverage=0 so a raster that only partly fills a cloud injects no phantom signal.")
+                    help="Folder of pre-made previous-year rasters (GeoTIFF/ASC/.npz). Tifs are matched "
+                         "to clouds SPATIALLY (extent intersection; mosaicked if several cover one cloud); "
+                         ".npz by file stem. NoData / uncovered cells are kept as coverage=0 so a raster "
+                         "that only partly fills a cloud injects no phantom signal.")
+    ap.add_argument("--project-dir", default=None,
+                    help="Project tree: each subfolder = one survey with a LAS folder and (optionally) a "
+                         "previous-DTM folder, e.g. 'TRAINING DATA/P_13820/{LAS, Previous DTM}'. Each "
+                         "project's rasters are spatially matched to ITS clouds. Overrides --input-dir.")
+    ap.add_argument("--epsg", type=int, default=None,
+                    help="Expected CRS EPSG (e.g. 27700 British National Grid). Rasters reporting a "
+                         "different EPSG are flagged loudly (matching is coordinate-based, so a CRS "
+                         "mismatch would silently mis-place priors).")
     ap.add_argument("--config", default=None)
     ap.add_argument("--res", type=float, default=None, help="Raster resolution (m).")
     ap.add_argument("--workers", type=int, default=None)
@@ -141,7 +156,14 @@ def main():
 
     os.makedirs(args.root, exist_ok=True)
     man_path = os.path.join(args.root, "manifest.json")
-    if args.input_dir:
+    if args.project_dir:
+        manifest = build_project_manifest(args.project_dir)
+        n_cl = sum(len(p.get("clouds", [])) for p in manifest["pairs"])
+        with open(man_path, "w") as fh:
+            json.dump(manifest, fh, indent=2)
+        print(f"[02] project tree {args.project_dir}: {len(manifest['pairs'])} projects, {n_cl} clouds "
+              f"({sum(1 for p in manifest['pairs'] if p.get('raster_dir'))} with a previous-DTM folder) -> {man_path}")
+    elif args.input_dir:
         manifest = build_folder_manifest(args.input_dir, args.prev_dir)
         n_cl = sum(len(p.get("clouds", [])) for p in manifest["pairs"])
         n_tw = sum(len(p.get("prev_clouds", [])) for p in manifest["pairs"])
@@ -163,26 +185,38 @@ def main():
 
     n_cpu = os.cpu_count() or 4
 
-    # ---- pre-made raster folder (hand-crafted previous-year priors) ---------------
-    # Authoritative for the official run: match a raster to each cloud by file stem and
-    # build the 5-channel prior from it. Partial coverage is preserved (NoData -> cover 0).
-    if args.raster_dir:
+    # ---- pre-made raster mode (hand-crafted previous-year priors) -------------------
+    # Tifs are matched SPATIALLY (extent intersection) per pair -- project DTMs rarely
+    # share tile names with the LAS files -- and mosaicked when several cover one cloud.
+    # Partial coverage is preserved (NoData -> coverage 0). .npz falls back to stem match.
+    any_raster = args.raster_dir or any(e.get("raster_dir") for e in pairs)
+    if any_raster:
         rtasks = []
         sub = os.path.join(prior_dir, "manual")
         os.makedirs(sub, exist_ok=True)
+        all_warns = []
         for pid, e in enumerate(pairs):
             clouds = e.get("clouds", [])
             e.setdefault("prior_rasters", [None] * len(clouds))
-            rmatch = match_rasters(clouds, args.raster_dir)
-            for i, (c, rp) in enumerate(zip(clouds, rmatch)):
-                if rp is None:
+            rdir = e.get("raster_dir") or args.raster_dir
+            if not rdir or not clouds:
+                continue
+            spatial, warns = match_rasters_spatial(clouds, rdir, epsg=args.epsg)
+            all_warns += warns
+            stem = match_rasters(clouds, rdir)                    # fallback (covers .npz)
+            for i, c in enumerate(clouds):
+                hits = spatial[i] or ([stem[i]] if stem[i] else [])
+                if not hits:
                     continue
                 op = os.path.join(sub, os.path.splitext(os.path.basename(c))[0] + ".npz")
-                rtasks.append((c, rp, op, res))
+                rtasks.append((c, hits, op, res, cloud_bounds(c)))
+        for w in sorted(set(all_warns)):
+            print(f"[02] WARNING CRS: {w} -- spatial matching assumes ONE shared CRS; "
+                  f"reproject the raster or expect mis-placed priors.")
         n_match = len(rtasks)
         n_total = sum(len(e.get("clouds", [])) for e in pairs)
-        print(f"[02] pre-made raster mode: {n_match}/{n_total} clouds matched a raster in "
-              f"{args.raster_dir} (unmatched clouds get no prior -> prev-DTM zero-filled)")
+        print(f"[02] pre-made raster mode: {n_match}/{n_total} clouds matched raster(s) spatially "
+              f"(unmatched clouds get no prior -> prev-DTM zero-filled)")
         nw = max(min(int(args.workers) if args.workers else min(n_cpu, 32), n_match or 1), 1)
         if rtasks:
             def _runr(k):

@@ -433,6 +433,39 @@ def prior_from_raster_file(path, res=None) -> Optional[MultiRaster]:
     return prior_from_dtm_grid(band, x_min, y_min, tgt, nodata=nodata)
 
 
+def prior_from_raster_files(paths, res=None, bounds=None, margin=25.0) -> Optional[MultiRaster]:
+    """Build the 5-channel prior from one OR SEVERAL rasterio-readable rasters
+    (mosaicked; e.g. two project DTMs covering one survey area). If ``bounds``
+    (xmin, ymin, xmax, ymax) is given -- typically the cloud's extent -- the mosaic is
+    cropped to it plus ``margin`` metres, so a project-wide DTM yields a compact
+    per-cloud prior. NoData stays honest: uncovered cells -> coverage 0."""
+    paths = [p for p in (paths or []) if p]
+    if not paths:
+        return None
+    import rasterio
+    from rasterio.merge import merge
+    with rasterio.open(paths[0]) as _s:
+        nodata = _s.nodata
+        native = abs(float(_s.transform.a))
+    tgt = float(res) if res else (native or 1.0)
+    srcs = [rasterio.open(p) for p in paths]
+    try:
+        kw = dict(res=(tgt, tgt))
+        if bounds is not None:
+            x0, y0, x1, y1 = bounds
+            kw["bounds"] = (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
+        if nodata is not None:
+            kw["nodata"] = nodata
+        mosaic, transform = merge(srcs, **kw)
+    finally:
+        for s in srcs:
+            s.close()
+    band = np.flipud(mosaic[0].astype(np.float32))                # rasterio row0=north -> row0=y_min
+    x_min = float(transform.c)
+    y_min = float(transform.f) - band.shape[0] * tgt
+    return prior_from_dtm_grid(band, x_min, y_min, tgt, nodata=nodata)
+
+
 def prior_coverage_mask(prior: "MultiRaster", xy: np.ndarray) -> np.ndarray:
     """Per-point boolean: is (x,y) INSIDE the raster extent AND on a covered cell?
 

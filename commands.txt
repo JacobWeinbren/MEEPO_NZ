@@ -1,0 +1,16 @@
+set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+set POINT_MOE_SSD_GROUP_MB=512
+set POINT_MOE_SSD_CHUNK=128
+
+python scripts\02_build_prior_raster.py --project-dir "C:\Users\user\Desktop\TRAINING DATA" --root data\official --epsg 27700 --workers 8
+
+python scripts\04_preprocess.py --root data\official --out data\official\tiles --dl 0.1 --in-radius 6 --workers 8
+
+python scripts\05_train.py --tiles data\official\tiles --scene-mode --backbone meepo --dl 0.1 ^
+  --scene-max-points 102400 --batch-num 1 --accum-steps 12 --num-workers 4 ^
+  --epochs 6 --epoch-steps 1000 --scene-val-tiles 32 --n-vis-tiles 12 ^
+  --refine spag_dc --spag-learned --spag-rl ^
+  --spag-rl-every 20 --spag-rl-max-points 30000 --spag-rl-reward rmse ^
+  --spag-rl-eval-every 200 --spag-rl-eval-tiles 12 ^
+  --checkpoint-granularity block ^
+  --tta --device cuda --out-dir runs --name meepo --log-every 25 --scene-vote-step 50
