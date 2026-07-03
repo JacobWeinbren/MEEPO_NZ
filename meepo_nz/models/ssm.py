@@ -92,6 +92,89 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None,
 _SSM_BACKEND_REPORTED = False
 
 
+# ---- SSD hot ops, hoisted to module level so torch.compile caches them ---------------
+# (compiling per-call closures would recompile on EVERY scan call). The same functions
+# serve the eager path, so compiled and eager can never diverge in math.
+
+def _ssd_intra_sel(S_g, b_g, C_g, notri):
+    diff = (S_g.unsqueeze(4) - S_g.unsqueeze(3)).masked_fill(notri, float("-inf"))
+    M = torch.exp(diff)                                           # (B,D,G,c,c,N)
+    h = torch.einsum("bdgtsn,bdgsn->bdgtn", M, b_g)
+    return torch.einsum("bdgtn,bngt->bdgt", h, C_g), h[:, :, :, -1]
+
+
+def _ssd_intra_ti(S_g, b_g, C_g, notri):
+    diff = (S_g.unsqueeze(4) - S_g.unsqueeze(3)).masked_fill(notri, float("-inf"))
+    M = torch.exp(diff)
+    h = torch.einsum("bdgtsn,bdgsn->bdgtn", M, b_g)
+    return torch.einsum("bdgtn,dn->bdgt", h, C_g), h[:, :, :, -1]
+
+
+def _ssd_carry_sel(S_g, C_g, hin_g):
+    return torch.einsum("bdgtn,bdgn,bngt->bdgt", torch.exp(S_g), hin_g, C_g)
+
+
+def _ssd_carry_ti(S_g, C_g, hin_g):
+    return torch.einsum("bdgtn,bdgn,dn->bdgt", torch.exp(S_g), hin_g, C_g)
+
+
+_SSD_EAGER = {"intra_sel": _ssd_intra_sel, "intra_ti": _ssd_intra_ti,
+              "carry_sel": _ssd_carry_sel, "carry_ti": _ssd_carry_ti}
+_SSD_COMPILE = {"tried": False, "fns": None, "failed": False}
+
+
+def _ssd_fns():
+    """Opt-in torch.compile of the SSD hot ops (POINT_MOE_SSD_COMPILE=1). On Windows this
+    rides `pip install triton-windows` (Triton JIT-compiles GPU kernels with its bundled
+    LLVM -- no MSVC, no admin). EXPERIMENTAL: any failure at compile time or on first
+    execution falls back to eager for the rest of the run, with one loud message."""
+    import os
+    st = _SSD_COMPILE
+    if not st["tried"]:
+        st["tried"] = True
+        if os.environ.get("POINT_MOE_SSD_COMPILE", "0") == "1":
+            try:
+                st["fns"] = {k: torch.compile(f) for k, f in _SSD_EAGER.items()}
+                print("[ssm] POINT_MOE_SSD_COMPILE=1: torch.compile wrapped the SSD ops "
+                      "(first call per shape JIT-compiles -- expect the first step to be "
+                      "slow; steady-state should be faster).", flush=True)
+            except Exception as e:
+                st["failed"] = True
+                print(f"[ssm] POINT_MOE_SSD_COMPILE=1 but torch.compile setup failed "
+                      f"({type(e).__name__}: {e}) -> eager SSD ops.", flush=True)
+    return st["fns"] if (st["fns"] and not st["failed"]) else None
+
+
+try:                                                            # checkpoint's internal
+    from torch.utils.checkpoint import _StopRecomputationError as _StopRecomp
+except Exception:                                               # control-flow exception --
+    class _StopRecomp(BaseException):                           # must NEVER be swallowed
+        pass
+
+
+def _ssd_call(key, *args):
+    """Compiled op if enabled and healthy; eager otherwise. Fallback wrapping applies only
+    until the first success ('committed'), after which the compiled op is called bare so
+    checkpoint's control-flow exceptions (early-stop of recompute) pass through untouched.
+    A pre-commit failure permanently falls back (ops are pure, so mid-run fallback is safe)."""
+    fns = _ssd_fns()
+    if fns is None:
+        return _SSD_EAGER[key](*args)
+    if _SSD_COMPILE.get("ok"):
+        return fns[key](*args)
+    try:
+        out = fns[key](*args)
+    except _StopRecomp:
+        raise
+    except Exception as e:
+        _SSD_COMPILE["failed"] = True
+        print(f"[ssm] compiled SSD op '{key}' failed ({type(e).__name__}: {e}) -> eager "
+              f"for the rest of the run.", flush=True)
+        return _SSD_EAGER[key](*args)
+    _SSD_COMPILE["ok"] = True
+    return out
+
+
 def _discretize(u, delta, A, B, delta_bias, delta_softplus):
     """Shared fp32 preamble: softplus(delta+bias), lam = delta*A (log-decay),
     deltaB_u = (delta*B)*u. Returns (u32, lam, deltaB_u) with lam/deltaB_u (B,D,L,N)."""
@@ -157,25 +240,14 @@ def selective_scan_ssd(u, delta, A, B, C, D=None, z=None,
     budget = float(os.environ.get("POINT_MOE_SSD_GROUP_MB", "128")) * 1e6
     G = max(1, min(nc, int(budget / max(batch * dim * c * c * n * 4, 1))))
 
+    key_i = "intra_sel" if C_sel else "intra_ti"
+    key_c = "carry_sel" if C_sel else "carry_ti"
+
     def _intra(S_g, b_g, C_g):
-        """All-parallel within-chunk work for a GROUP of chunks: no carried state.
-        Returns (y_intra_g, intra_last_g). Pure in its args -> checkpointable."""
-        # M[k,t,s] = exp(S_t - S_s) for t >= s else 0 == prod_{r=s+1..t} deltaA_r
-        # (mask BEFORE exp: upper-triangle diffs are positive and would overflow)
-        diff = (S_g.unsqueeze(4) - S_g.unsqueeze(3)).masked_fill(notri, float("-inf"))
-        M = torch.exp(diff)                                       # (B,D,G,c,c,N)
-        h_g = torch.einsum("bdgtsn,bdgsn->bdgtn", M, b_g)
-        if C_sel:
-            y_g = torch.einsum("bdgtn,bngt->bdgt", h_g, C_g)
-        else:
-            y_g = torch.einsum("bdgtn,dn->bdgt", h_g, C_g)
-        return y_g, h_g[:, :, :, -1]
+        return _ssd_call(key_i, S_g, b_g, C_g, notri)
 
     def _carry_readout(S_g, C_g, hin_g):
-        """Contribution of each chunk's incoming state to its outputs: C_t.(exp(S_t) hin)."""
-        if C_sel:
-            return torch.einsum("bdgtn,bdgn,bngt->bdgt", torch.exp(S_g), hin_g, C_g)
-        return torch.einsum("bdgtn,bdgn,dn->bdgt", torch.exp(S_g), hin_g, C_g)
+        return _ssd_call(key_c, S_g, C_g, hin_g)
 
     needs_grad = torch.is_grad_enabled() and (lam.requires_grad or b.requires_grad
                                               or C32.requires_grad)
@@ -258,6 +330,7 @@ def selective_scan(u, delta, A, B, C, D=None, z=None,
                 if picked == "ssd":
                     print(f"[ssm] fused mamba_ssm kernel unavailable ({type(_e).__name__}) -> using the "
                           f"chunked SSD scan (Mamba-2 algorithm, pure torch). Same math (verified); "
+                          f"(experimental extra speed: pip install triton-windows + POINT_MOE_SSD_COMPILE=1) "
                           f"slower than the fused kernel but ~chunk-fold fewer sequential steps than "
                           f"the naive loop. To require the kernel: --ssm-backend cuda.", flush=True)
                 else:
