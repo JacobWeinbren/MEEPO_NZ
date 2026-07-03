@@ -143,50 +143,78 @@ def selective_scan_ssd(u, delta, A, B, C, D=None, z=None,
     nc = lam.shape[2] // c
     lam = lam.view(batch, dim, nc, c, n)
     b = b.view(batch, dim, nc, c, n)
+    S = torch.cumsum(lam, dim=3)                                  # S_t = sum_{r<=t} lam_r
 
     tri = torch.ones(c, c, dtype=torch.bool, device=u.device).tril()
-    neg_inf = float("-inf")
+    notri = (~tri).view(1, 1, 1, c, c, 1)
     C32 = C.float()
     C_sel = C32.dim() == 3
     if C_sel:                                                     # (B,N,L) -> (B,N,nc,c)
         Cp = F.pad(C32, (0, pad)).view(batch, -1, nc, c)
 
-    def _chunk(lam_k, b_k, C_k, h_in):
-        """One chunk: (y_k, h_out) from its slice + carried state. Pure in its tensor
-        args, so it can be gradient-checkpointed: backward re-runs THIS chunk only."""
-        S_k = torch.cumsum(lam_k, dim=2)                          # (B,D,c,N)
-        # M[t,s] = exp(S_t - S_s) for t >= s else 0  == prod_{r=s+1..t} deltaA_r
-        diff = S_k.unsqueeze(3) - S_k.unsqueeze(2)                # (B,D,t,s,N)
-        M = torch.exp(diff.masked_fill(~tri.view(1, 1, c, c, 1), neg_inf))
-        h_k = torch.einsum("bdtsn,bdsn->bdtn", M, b_k)            # within-chunk states
-        h_k = h_k + torch.exp(S_k) * h_in.unsqueeze(2)            # + carried state
-        if C_sel:
-            y_k = torch.einsum("bdtn,bnt->bdt", h_k, C_k)
-        else:
-            y_k = torch.einsum("bdtn,dn->bdt", h_k, C_k)
-        return y_k, h_k[:, :, -1]
+    # Group size: process G chunks per batched op, sized so one group's pairwise-decay
+    # tensor (B,D,G,c,c,N) stays within a memory budget (default 128 MB; env-tunable).
+    budget = float(os.environ.get("POINT_MOE_SSD_GROUP_MB", "128")) * 1e6
+    G = max(1, min(nc, int(budget / max(batch * dim * c * c * n * 4, 1))))
 
-    # Training memory: WITHOUT checkpointing autograd retains every chunk's (B,D,c,c,N)
-    # decay matrix M for backward -- L/chunk of them, gigabytes at scale. Checkpointing
-    # each chunk stores only its slim inputs and recomputes M in backward: peak extra
-    # memory = ONE M (megabytes), cost ~1.3x scan compute. Disable: POINT_MOE_SSD_CKPT=0.
+    def _intra(S_g, b_g, C_g):
+        """All-parallel within-chunk work for a GROUP of chunks: no carried state.
+        Returns (y_intra_g, intra_last_g). Pure in its args -> checkpointable."""
+        # M[k,t,s] = exp(S_t - S_s) for t >= s else 0 == prod_{r=s+1..t} deltaA_r
+        # (mask BEFORE exp: upper-triangle diffs are positive and would overflow)
+        diff = (S_g.unsqueeze(4) - S_g.unsqueeze(3)).masked_fill(notri, float("-inf"))
+        M = torch.exp(diff)                                       # (B,D,G,c,c,N)
+        h_g = torch.einsum("bdgtsn,bdgsn->bdgtn", M, b_g)
+        if C_sel:
+            y_g = torch.einsum("bdgtn,bngt->bdgt", h_g, C_g)
+        else:
+            y_g = torch.einsum("bdgtn,dn->bdgt", h_g, C_g)
+        return y_g, h_g[:, :, :, -1]
+
+    def _carry_readout(S_g, C_g, hin_g):
+        """Contribution of each chunk's incoming state to its outputs: C_t.(exp(S_t) hin)."""
+        if C_sel:
+            return torch.einsum("bdgtn,bdgn,bngt->bdgt", torch.exp(S_g), hin_g, C_g)
+        return torch.einsum("bdgtn,bdgn,dn->bdgt", torch.exp(S_g), hin_g, C_g)
+
     needs_grad = torch.is_grad_enabled() and (lam.requires_grad or b.requires_grad
                                               or C32.requires_grad)
     use_ckpt = needs_grad and os.environ.get("POINT_MOE_SSD_CKPT", "1") != "0"
     if use_ckpt:
         from torch.utils.checkpoint import checkpoint as _ckpt
+        run_intra = lambda *a: _ckpt(_intra, *a, use_reentrant=False)
+        run_carry = lambda *a: _ckpt(_carry_readout, *a, use_reentrant=False)
+    else:
+        run_intra, run_carry = _intra, _carry_readout
 
-    h_in = u.new_zeros((batch, dim, n))
+    def _Cslice(g0, g1):
+        return Cp[:, :, g0:g1] if C_sel else C32
+
+    # Pass 1 (parallel, grouped): within-chunk outputs + each chunk's final intra state.
+    y_intras, intra_lasts = [], []
+    for g0 in range(0, nc, G):
+        g1 = min(g0 + G, nc)
+        y_g, last_g = run_intra(S[:, :, g0:g1], b[:, :, g0:g1], _Cslice(g0, g1))
+        y_intras.append(y_g)
+        intra_lasts.append(last_g)
+    intra_last = torch.cat(intra_lasts, dim=2)                    # (B,D,nc,N)
+    a_chunk = torch.exp(S[:, :, :, -1])                           # whole-chunk decay (B,D,nc,N)
+
+    # Sequential part: ONLY the tiny (B,D,N) carry recurrence over nc chunks
+    # (h_out[k] = a_chunk[k]*h_in[k] + intra_last[k]); ~1 fused op per chunk.
+    h = u.new_zeros((batch, dim, n))
+    h_ins = []
+    for k in range(nc):
+        h_ins.append(h)
+        h = torch.addcmul(intra_last[:, :, k], a_chunk[:, :, k], h)
+    h_ins = torch.stack(h_ins, dim=2)                             # (B,D,nc,N)
+
+    # Pass 2 (parallel, grouped): add each incoming state's contribution to the outputs.
     ys = []
-    for k in range(nc):                                           # sequential ONLY over chunks
-        C_k = Cp[:, :, k] if C_sel else C32
-        if use_ckpt:
-            y_k, h_in = _ckpt(_chunk, lam[:, :, k], b[:, :, k], C_k, h_in,
-                              use_reentrant=False)
-        else:
-            y_k, h_in = _chunk(lam[:, :, k], b[:, :, k], C_k, h_in)
-        ys.append(y_k)
-    y = torch.cat(ys, dim=2)[:, :, :L]                            # (B,D,L)
+    for i, g0 in enumerate(range(0, nc, G)):
+        g1 = min(g0 + G, nc)
+        ys.append(y_intras[i] + run_carry(S[:, :, g0:g1], _Cslice(g0, g1), h_ins[:, :, g0:g1]))
+    y = torch.cat(ys, dim=2).reshape(batch, dim, nc * c)[:, :, :L]
 
     if D is not None:
         y = y + u * D.float()[None, :, None]
