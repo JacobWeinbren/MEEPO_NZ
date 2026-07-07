@@ -144,6 +144,12 @@ def main():
                          "For the previous-year prior, run stage 02 with --input-dir/--prev-dir first, then "
                          "pass this stage the same --root.")
     ap.add_argument("--out", default=None, help="Tile output dir (default <root>/tiles).")
+    ap.add_argument("--ground-classes", default=None,
+                    help="Comma list of ASPRS codes counted as GROUND (default '2,9').")
+    ap.add_argument("--unclassified-classes", default=None,
+                    help="Comma list of ASPRS codes mapped to IGNORE (default '0,1'). If your data marks "
+                         "all non-ground as class 1 (British EA convention), pass '0' so class 1 counts "
+                         "as NON-GROUND instead of being excluded from the loss.")
     ap.add_argument("--config", default=None)
     ap.add_argument("--limit", type=int, default=0, help="Process at most N clouds (debug).")
     ap.add_argument("--auto-dl", action="store_true",
@@ -184,6 +190,48 @@ def main():
               f"prev-DTM feature zero-filled). Run stage 02 first if you have previous-year data.")
     else:
         ap.error(f"no manifest.json under {args.root!r} and no --input-dir given")
+
+    # ---- label class-mapping overrides (baked into tiles; see config comments) ----
+    if getattr(args, "ground_classes", None):
+        cfg.ground_classes = tuple(int(x) for x in args.ground_classes.split(","))
+    if getattr(args, "unclassified_classes", None) is not None:
+        cfg.unclassified_classes = tuple(int(x) for x in args.unclassified_classes.split(",")
+                                         ) if args.unclassified_classes.strip() else tuple()
+
+    # ---- raw ASPRS classification histogram (sampled) + mapped-label preview -------
+    # The check that catches dataset label conventions BEFORE a wasted training run:
+    # if most points map to IGNORE, the loss never sees them and the model degenerates
+    # toward predicting the supervised majority (usually: ground everywhere).
+    try:
+        import collections
+        import laspy as _laspy
+        _sample = [c for e in manifest.get("pairs", []) for c in e.get("clouds", [])][:6]
+        if _sample:
+            hist = collections.Counter()
+            for _c in _sample:
+                with _laspy.open(_c) as _f:
+                    hist.update(np.asarray(_f.read().classification).tolist())
+            tot = max(sum(hist.values()), 1)
+            top = ", ".join(f"{k}:{100.0*v/tot:.1f}%"
+                            for k, v in sorted(hist.items(), key=lambda kv: -kv[1])[:8])
+            gc = tuple(getattr(cfg, "ground_classes", (2, 9)))
+            uc = tuple(getattr(cfg, "unclassified_classes", (0, 1)))
+            fg = sum(v for k, v in hist.items() if k in gc) / tot
+            fi = sum(v for k, v in hist.items() if k in uc) / tot
+            fn = 1.0 - fg - fi
+            print(f"[04] raw class histogram ({len(_sample)} sampled clouds): {top}")
+            print(f"[04] mapped with ground={gc} ignore={uc}: ground {100*fg:.1f}%  "
+                  f"non-ground {100*fn:.1f}%  IGNORE {100*fi:.1f}%")
+            if fi > 0.30:
+                print(f"[04] *** WARNING: {100*fi:.0f}% of points map to IGNORE -- excluded from the "
+                      f"loss AND metrics. If class 1 means 'non-ground' in this dataset (British EA "
+                      f"convention: only ground is classified), re-run stage 04 with "
+                      f"--unclassified-classes 0 so class 1 supervises as NON-GROUND. ***")
+            if fn < 0.05:
+                print(f"[04] *** WARNING: only {100*fn:.1f}% of points supervise as NON-GROUND -- a "
+                      f"model trained on this degenerates to predicting ground everywhere. ***")
+    except Exception as _e:
+        print(f"[04] (class-histogram preview skipped: {type(_e).__name__}: {_e})")
 
     # flatten (cloud, prior-raster, dtm-raster, pair_id) jobs. Prefer the per-cloud
     # 5-channel prior (pair["prior_rasters"][i], stage 02_build_prior_raster); fall

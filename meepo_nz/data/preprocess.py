@@ -55,7 +55,10 @@ def preprocess_points(
     n_raw = xyz.shape[0]
     if n_raw < int(cfg.sphere_min_points):
         return 0
-    labels_all = label_from_classification(classification)
+    labels_all = label_from_classification(
+        classification,
+        ground_classes=getattr(cfg, "ground_classes", None),
+        unclassified_classes=getattr(cfg, "unclassified_classes", None))
 
     # ---- whole-cloud grid subsample (KPConv): barycentre + majority label ----
     # carry the per-point attributes (num_returns, return_number, intensity)

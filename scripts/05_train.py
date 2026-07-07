@@ -39,7 +39,10 @@ def main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--epoch-steps", type=int, default=None,
-                    help="Optimizer steps per epoch (fixed-step epoch; default from config).")
+                    help="Optimiser steps per epoch (KPConv fixed-step epoch; the config default was "
+                         "sized for the ~2800-tile NZ corpus). 0 = ONE FULL PASS over all train tiles "
+                         "per epoch -- use this for small corpora (with more --epochs) to avoid "
+                         "recycling the same tiles hundreds of times per epoch at full LR.")
     ap.add_argument("--val-size", type=int, default=None,
                     help="Validation steps per epoch (default 50; 0 = full validation pass).")
     ap.add_argument("--log-every", type=int, default=None,

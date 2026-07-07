@@ -305,6 +305,86 @@ class Trainer:
             return torch.ones(self.cfg.num_classes)
         return inverse_frequency_weights(counts, self.cfg.num_classes)
 
+    def _data_diagnostics(self, nsamp):
+        """Startup sanity printed before the first step: label balance per split, the
+        epoch-repetition factor, and feature-channel means. Catches the two silent
+        killers -- a label convention that IGNOREs most points (loss never sees them ->
+        model degenerates to all-ground), and a fixed-step epoch recycling a tiny corpus
+        at full LR (memorisation) -- BEFORE ~100 GPU-hours get spent. Never raises."""
+        import glob
+        import json
+        import numpy as np
+        try:
+            n_tr = len(self.train_set)
+            td = getattr(self.train_set, "tile_dir", None) or getattr(self.cfg, "tile_dir", None)
+            if td and os.path.isdir(td):
+                fr = {}
+                for split in ("train", "val"):
+                    cnt = np.zeros(3, dtype=np.int64)
+                    used = 0
+                    for p in sorted(glob.glob(os.path.join(td, "*.npz"))):
+                        if used >= 16:
+                            break
+                        try:
+                            with np.load(p, allow_pickle=True) as d:
+                                s = str(d["split"]) if "split" in d.files else "train"
+                            if s != split:
+                                continue
+                            lab = np.load(p[:-4] + ".labels.npy", mmap_mode="r")
+                            step = max(1, lab.shape[0] // 200000)
+                            cnt += np.bincount(np.asarray(lab[::step]).ravel().astype(np.int64),
+                                               minlength=3)[:3]
+                            used += 1
+                        except Exception:
+                            continue
+                    tot = max(int(cnt.sum()), 1)
+                    fr[split] = (cnt[1] / tot, cnt[0] / tot, cnt[2] / tot, used)
+                for split, (g, ng, ig, used) in fr.items():
+                    print(f"[diag] {split} labels ({used} tiles sampled): ground {100*g:.1f}%  "
+                          f"non-ground {100*ng:.1f}%  IGNORE {100*ig:.1f}%", flush=True)
+                g, ng, ig, _u = fr.get("train", (0.0, 0.0, 0.0, 0))
+                if ig > 0.30:
+                    print(f"[diag] *** WARNING: {100*ig:.0f}% of train points are IGNORE -- excluded "
+                          f"from the loss AND the metrics. If this dataset marks non-ground as ASPRS "
+                          f"class 1 (common in British EA products: only ground is classified), the "
+                          f"loss supervises ~only ground and the model degenerates to predicting "
+                          f"ground everywhere. Fix: re-run stage 04 with --unclassified-classes 0 "
+                          f"(labels are baked into tiles). ***", flush=True)
+                elif ng < 0.05:
+                    print(f"[diag] *** WARNING: only {100*ng:.1f}% of train points supervise as "
+                          f"NON-GROUND -- expect collapse toward all-ground predictions. ***",
+                          flush=True)
+            if nsamp > 0 and n_tr > 0:
+                rep = nsamp / float(n_tr)
+                if rep > 8:
+                    print(f"[diag] *** WARNING: fixed-step epoch draws {nsamp} samples from only "
+                          f"{n_tr} train tiles = ~{rep:.0f} views/tile PER EPOCH at full LR -- a "
+                          f"memorisation regime (epoch size was tuned for a much larger corpus). "
+                          f"For small corpora use --epoch-steps 0 (= one full pass per epoch) with "
+                          f"more --epochs; wall-time per epoch shrinks proportionally. ***",
+                          flush=True)
+                else:
+                    print(f"[diag] epoch draws {nsamp} samples over {n_tr} train tiles "
+                          f"(~{rep:.1f} views/tile)", flush=True)
+            if td:
+                ns = os.path.join(td, "norm_stats.json")
+                if os.path.exists(ns):
+                    with open(ns) as fh:
+                        st = json.load(fh)
+                    mean = st.get("mean")
+                    if mean:
+                        mm = ", ".join(f"{float(m):+.2f}" for m in mean)
+                        print(f"[diag] feature channel means: [{mm}]", flush=True)
+                        big = [i for i, m in enumerate(mean) if abs(float(m)) > 10.0]
+                        if big:
+                            print(f"[diag] *** WARNING: channel(s) {big} have |mean| > 10 -- if one "
+                                  f"of these is the z-minus-previous-DTM channel, the prior DTM and "
+                                  f"the LAS heights disagree (vertical datum / units) and the prior "
+                                  f"misleads rather than helps. Check the prior rasters' datum. ***",
+                                  flush=True)
+        except Exception as e:
+            print(f"[diag] (startup diagnostics skipped: {type(e).__name__}: {e})", flush=True)
+
     def _loaders(self):
         import numpy as np
         from torch.utils.data import RandomSampler, SubsetRandomSampler
@@ -373,6 +453,7 @@ class Trainer:
         if nw > 0:
             print(f"[setup] DataLoader workers={nw} (parallel multiscale-batch build), "
                   f"pin_memory={pin}")
+        self._data_diagnostics(nsamp)
         steps = nsamp // bs if nsamp > 0 else (len(self.train_set) // bs)
         vshown = min(vsteps, n_val // bs) if vsteps > 0 else (n_val // bs)
         kind = "KPConv fixed-step epoch" if nsamp > 0 else "full pass over all tiles"

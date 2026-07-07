@@ -145,19 +145,32 @@ def _safe_parse_crs(las):
         return None
 
 
-def label_from_classification(classification: np.ndarray) -> np.ndarray:
+def label_from_classification(classification: np.ndarray,
+                              ground_classes=None,
+                              unclassified_classes=None) -> np.ndarray:
     """ASPRS class codes -> training label.
 
-    1 = ground/water (GROUND_CLASSES), 0 = non-ground, IGNORE_LABEL (2) =
-    unclassified (UNCLASSIFIED_CLASSES = {0, 1}). Unclassified points are kept in
+    1 = ground/water (ground_classes, default GROUND_CLASSES = {2, 9}),
+    0 = non-ground, IGNORE_LABEL (2) = unclassified (unclassified_classes,
+    default UNCLASSIFIED_CLASSES = {0, 1}). Unclassified points are kept in
     the cloud as geometric context but carry the ignore label, so they are excluded
     from BOTH the loss (CrossEntropyLoss ignore_index) and the metrics (the
     confusion accumulator only counts true in {0, 1}).
+
+    DATASET-CONVENTION WARNING: the defaults suit LINZ/PNOA-style data where real
+    non-ground codes (3-6, ...) exist and 0/1 mean 'never classified'. Many national
+    datasets (e.g. some British EA products) classify ONLY ground and leave ALL
+    non-ground as class 1 -- under the defaults that IGNORES every non-ground point,
+    the loss then supervises ground only, and the model degenerates to predicting
+    ground everywhere. For such data pass unclassified_classes=(0,) (stage 04:
+    --unclassified-classes 0) so class 1 counts as non-ground.
     """
     classification = np.asarray(classification)
+    gc = tuple(ground_classes) if ground_classes is not None else GROUND_CLASSES
+    uc = tuple(unclassified_classes) if unclassified_classes is not None else UNCLASSIFIED_CLASSES
     out = np.zeros(classification.shape, dtype=np.int64)              # 0 = non-ground (default)
-    out[np.isin(classification, GROUND_CLASSES)] = 1                  # 2 / 9  -> ground
-    out[np.isin(classification, UNCLASSIFIED_CLASSES)] = IGNORE_LABEL  # 0 / 1  -> ignore
+    out[np.isin(classification, gc)] = 1                              # ground
+    out[np.isin(classification, uc)] = IGNORE_LABEL                   # ignore
     return out
 
 
