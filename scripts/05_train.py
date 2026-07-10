@@ -253,7 +253,11 @@ def main():
                     help="MEEPO-3 mixer d_state (default 4 = two complex pairs; even, or 1 for the RoPE-free graded mode).")
     ap.add_argument("--pointssm-state", type=int, default=None,
                     help="Override PointSSM MambaConv d_state (paper 32; PointSSM Tab.11: 16 costs ~1.2 mIoU). Fallback if the fused kernel misbehaves at N=32 on sm_120.")
-    ap.add_argument("--ssm-backend", choices=["auto", "cuda", "ssd", "torch"], default=None,
+    ap.add_argument("--offload-activations", action="store_true",
+                    help="Save activations to pinned CPU RAM during forward, restore in backward "
+                         "(torch saved-tensor hooks; Arctic-LST-style). Exact math; GPU footprint "
+                         "drops to ~model+optimizer+one segment. Needs headroom in system RAM.")
+    ap.add_argument("--ssm-backend", choices=["auto", "cuda", "ssd", "torch", "triton-ssd"], default=None,
                     help="MEEPO selective-scan backend: auto=fused mamba_ssm kernel if importable else pure-torch (default); cuda=require the kernel; torch=force pure-torch (exact, slower).")
     ap.add_argument("--no-moe", action="store_true", help="Disable MoE (dense PTv3).")
     ap.add_argument("--num-experts", type=int, default=None)
@@ -446,6 +450,9 @@ def main():
     if args.vm3_chunk_size is not None:   cfg.vm3_chunk_size = args.vm3_chunk_size
     if args.vm3_mlp_ratio is not None:    cfg.vm3_mlp_ratio = args.vm3_mlp_ratio
     if args.vm3_drop_path is not None:    cfg.vm3_drop_path = args.vm3_drop_path
+    if args.offload_activations:
+        cfg.offload_activations = True
+        print("[05] activation OFFLOADING to pinned CPU RAM enabled (exact; train forward only).")
     if args.resplit_seed is not None:
         cfg.resplit_seed = int(args.resplit_seed)
         if args.resplit_val_frac is not None:  cfg.resplit_val_frac = float(args.resplit_val_frac)

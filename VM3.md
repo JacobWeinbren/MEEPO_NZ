@@ -175,3 +175,33 @@ IWE, and the Hilbert/Z complementary orders.
   in outputs and all gradient paths for 2- and 4-direction configs. This is
   the last identifiable exact-memory lever in the mixer: what remains saved
   per mixer is the in_proj output plus 4 tensors per direction of outputs.
+
+## r11 changes (2026-07-10) -- BODGE REVERT
+
+* REMOVED the r7-r9 memory machinery from the model code, returning the meepo
+  path to the original MEEPO structure: no conv gather checkpoint, no sequence
+  slicing, no per-direction checkpointing (the env vars POINT_MOE_SEQ_SLICE /
+  POINT_MOE_DIR_CKPT / POINT_MOE_CONV_CKPT no longer exist). Standard
+  --checkpoint-granularity block|layer remains (it predates the bodges and
+  matches Pointcept convention), as do the scan's built-in POINT_MOE_SSD_*
+  controls, the h0/return_last_state scan API (inert unless used), the r10
+  telemetry, the r4 vendored-kernel fix, r5 --mamba-directions, r6 preprocess
+  restoration, and r3 --resplit-seed.
+* Consequence: 512k-point training no longer fits a 16 GB card on this path;
+  see the memory-reduction plan in the chat log (kernel-level recompute via
+  official fused/Triton scans is the principled replacement).
+
+## r12 changes (2026-07-10)
+
+* `--offload-activations`: train-forward saved tensors go to pinned CPU RAM via
+  torch.autograd.graph.save_on_cpu and return for backward (Arctic-LST-style;
+  torchtune ships the same mechanism). Exact math (verified bit-exact on CPU);
+  GPU footprint ~ model + optimizer + one segment's recompute. Composes with
+  --checkpoint-granularity. Needs system-RAM headroom; costs transfer time.
+* `--ssm-backend triton-ssd` (EXPERIMENTAL): meepo's scan mapped onto
+  mamba_ssm's Triton Mamba-2 SSD kernel (nheads=d_inner, headdim=1, ngroups=1,
+  N=1) -- kernel-managed recompute, no Python checkpoint sandwich. Accuracy-
+  equivalent, not bit-exact; MUST pass scripts/check_triton_ssd.py on the GPU
+  box first (rel < 5e-3 gate). Fails loudly if Triton ops are unavailable.
+* WSL2 recipe (see chat): Ubuntu + CUDA + expandable_segments:True cures the
+  variable-shape allocator-pool growth that native Windows cannot.

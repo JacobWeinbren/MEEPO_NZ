@@ -126,6 +126,41 @@ def load_pretrained(model, path, verbose=True):
 
 
 class Trainer:
+
+    def _mem_debug(self):
+        """POINT_MOE_MEM_DEBUG=K: every K optimizer steps, census LIVE CUDA tensors
+        (count + MB grouped by dtype/shape, top 8) and the delta vs the last census.
+        Live total FLAT while reserved/shared grows => allocator/WDDM pool growth
+        (mitigate: POINT_MOE_EMPTY_CACHE_EVERY=1). Live total RISING => a real leak;
+        the fastest-growing shape below is the culprit's fingerprint."""
+        import gc as _gc
+        import os as _os
+        k = int(_os.environ.get("POINT_MOE_MEM_DEBUG", "0") or 0)
+        if not k or not torch.cuda.is_available():
+            return
+        if getattr(self, "_opt_steps_done", 0) % k:
+            return
+        by = {}
+        total = 0
+        for o in _gc.get_objects():
+            try:
+                if torch.is_tensor(o) and o.is_cuda:
+                    mb = o.numel() * o.element_size() / 2**20
+                    key = (str(o.dtype).replace("torch.", ""), tuple(o.shape))
+                    c, m = by.get(key, (0, 0.0))
+                    by[key] = (c + 1, m + mb)
+                    total += mb
+            except Exception:
+                continue
+        prev = getattr(self, "_mem_debug_prev", None)
+        self._mem_debug_prev = total
+        top = sorted(by.items(), key=lambda kv: -kv[1][1])[:8]
+        d = f" (delta {total - prev:+.0f}MB)" if prev is not None else ""
+        print(f"  [mem-debug @opt {getattr(self, '_opt_steps_done', 0)}] live CUDA tensors: "
+              f"{total:.0f}MB{d}; alloc={torch.cuda.memory_allocated()/2**30:.2f}G "
+              f"resv={torch.cuda.memory_reserved()/2**30:.2f}G", flush=True)
+        for (dt, shp), (c, m) in top:
+            print(f"      {m:8.0f}MB  x{c:<4d} {dt} {shp}", flush=True)
     def _maybe_empty_cache(self):
         # Windows lacks expandable_segments; long runs fragment the caching allocator.
         # POINT_MOE_EMPTY_CACHE_EVERY=K releases cached blocks every K optimizer steps
@@ -135,6 +170,7 @@ class Trainer:
         self._opt_steps_done = getattr(self, "_opt_steps_done", 0) + 1
         if k and torch.cuda.is_available() and self._opt_steps_done % k == 0:
             torch.cuda.empty_cache()
+        self._mem_debug()
 
     def __init__(self, model, cfg, train_set, val_set, collate, vis_set=None,
                  device: Optional[torch.device] = None):
@@ -754,7 +790,12 @@ class Trainer:
                 win_end = ((it + 1) % accum == 0) or (it == n_iter - 1)
 
                 with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                    logits = self.model(batch)
+                    import contextlib as _ctx
+                    _off = (torch.autograd.graph.save_on_cpu(pin_memory=True)
+                            if getattr(self.cfg, "offload_activations", False)
+                            and torch.cuda.is_available() else _ctx.nullcontext())
+                    with _off:
+                        logits = self.model(batch)
                     if getattr(self, "use_gdreg", False):
                         # GrounDiff: aux = continuous nDSM regression (pred, target)
                         aux_pred = getattr(self.model, "_reg_pred", None)
@@ -856,15 +897,22 @@ class Trainer:
                         _rl = (f" | spag-rl[{_sl.get('metric', 'rmse')}] g={_sl['score_base']:.2f} "
                                f"s={_sl['score_sample']:.2f} adv={_sl['advantage']:+.3f} "
                                f"reclass={_sl['reclass_frac']*100:.0f}% rmse={_sl['rmse_base']:.2f}m")
+                    _mem = (f" mem[a={torch.cuda.memory_allocated()/2**30:.1f} "
+                            f"r={torch.cuda.memory_reserved()/2**30:.1f} "
+                            f"pk={torch.cuda.max_memory_allocated()/2**30:.1f}G]"
+                            if torch.cuda.is_available() else "")
                     print(f"  e{epoch:03d} [{it + 1:4d}/{n_iter}]{_ostep} "
                           f"loss={running / max(it + 1 - nonfinite, 1):.4f} "
                           f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
                           f"{pps / 1e3:.1f}k pts/s "
-                          f"elapsed={_fmt_time(elapsed)} eta={_fmt_time(eta_ep)}{_rl}",
+                          f"elapsed={_fmt_time(elapsed)} eta={_fmt_time(eta_ep)}{_mem}{_rl}",
                           flush=True)
 
             if not getattr(self, "_onecycle_pmoe", False):
                 self.scheduler.step()                     # per-epoch schedulers (cosine/exp/kpx)
+            if torch.cuda.is_available() and int(__import__("os").environ.get(
+                    "POINT_MOE_EMPTY_CACHE_EVERY", "0") or 0):
+                torch.cuda.empty_cache()          # epoch boundary: drop stale-shape pool blocks
             train_metrics = conf.compute()
             train_loss = running / max(n_iter - nonfinite, 1)
             if nonfinite:

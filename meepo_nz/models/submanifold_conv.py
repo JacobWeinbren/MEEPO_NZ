@@ -225,24 +225,5 @@ class SubMConv3d(PointModule):
                 "clean-PyTorch conv (the CPU smoke test does this automatically)."
             )
         else:
-            feat = point.feat
-            # LEVEL-BELOW-'layer' CHECKPOINTING (accuracy-exact): the neighbour
-            # gather (N, K3, in) is the model's single largest saved-for-backward
-            # tensor and tiling only bounds the FORWARD transient -- autograd still
-            # keeps every tile's GEMM input. When that total is big, recompute the
-            # whole gather+GEMM in backward instead of storing it. Same math,
-            # ~one extra conv-forward per backward. POINT_MOE_CONV_CKPT=0 disables.
-            big = point.feat.shape[0] * self.K3 * self.in_channels > int(
-                getattr(self, "conv_ckpt_min_elems", 64_000_000))
-            if (big and torch.is_grad_enabled() and feat.requires_grad
-                    and os.environ.get("POINT_MOE_CONV_CKPT", "1") != "0"):
-                from torch.utils.checkpoint import checkpoint as _ckpt
-                # offset2batch runs under torch.inference_mode() -> point.batch is an
-                # inference tensor, which checkpoint refuses to save as an input.
-                # Clone the (small, integer) index tensors out of inference mode.
-                gc = point.grid_coord.clone() if point.grid_coord.is_inference() else point.grid_coord
-                bt = point.batch.clone() if point.batch.is_inference() else point.batch
-                point.feat = _ckpt(self._conv, gc, bt, feat, use_reentrant=False)
-            else:
-                point.feat = self._conv(point.grid_coord, point.batch, feat)
+            point.feat = self._conv(point.grid_coord, point.batch, point.feat)
         return point

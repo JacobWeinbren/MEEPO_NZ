@@ -75,7 +75,7 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--backbone", default=None, choices=["meepo", "meepo3", "pointssm", "vm3"],
                     help="Probe a specific backbone (default: cfg default).")
-    ap.add_argument("--ssm-backend", default=None, choices=["auto", "cuda", "ssd", "torch"])
+    ap.add_argument("--ssm-backend", default=None, choices=["auto", "cuda", "ssd", "torch", "triton-ssd"])
     args = ap.parse_args()
 
     device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")

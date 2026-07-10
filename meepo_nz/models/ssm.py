@@ -29,6 +29,8 @@ returns y : (B, D, L)
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -312,7 +314,7 @@ def selective_scan(u, delta, A, B, C, D=None, z=None,
     torch / ref -> the naive per-step reference loop (slow; kept for validation)
     """
     global _SSM_BACKEND_REPORTED
-    if backend not in ("auto", "cuda", "ssd", "torch", "ref"):
+    if backend not in ("auto", "cuda", "ssd", "torch", "ref", "triton-ssd"):
         raise ValueError(f"unknown ssm backend {backend!r}")
     if h0 is not None or return_last_state:
         # exact state carry (sequence slicing) is served by the pure-torch backends;
@@ -322,6 +324,26 @@ def selective_scan(u, delta, A, B, C, D=None, z=None,
         return fn(u, delta, A, B, C, D=D, z=z, delta_bias=delta_bias,
                   delta_softplus=delta_softplus, h0=h0,
                   return_last_state=return_last_state)
+    if backend == "triton-ssd":
+        # EXPERIMENTAL kernel backend: meepo's scan (d_state=1, per-channel decay,
+        # shared B/C) maps exactly onto Mamba-2 SSD with nheads=d_inner, headdim=1,
+        # ngroups=1, N=1. Pure Triton (works with triton-windows). Accuracy-
+        # equivalent, NOT bit-exact to the eager scan; gate with
+        # scripts/check_triton_ssd.py on the GPU box before training.
+        try:
+            from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+        except Exception as e:
+            raise RuntimeError(f"--ssm-backend triton-ssd needs mamba_ssm's Triton ops "
+                               f"(pip install --no-deps -e third_party/mamba-main; triton required): {e}")
+        Bt, Dd, L = u_.shape if False else (u.shape[0], u.shape[1], u.shape[2])
+        x = u.transpose(1, 2).unsqueeze(-1)                      # (B,L,H=D,P=1)
+        dtb = delta.transpose(1, 2)                              # (B,L,H) raw (bias/softplus in-kernel)
+        Bm = B.transpose(1, 2).unsqueeze(2) if B.dim() == 3 else B   # (B,L,G=1,N)
+        Cm = C.transpose(1, 2).unsqueeze(2) if C.dim() == 3 else C
+        y = mamba_chunk_scan_combined(
+            x, dtb, A.squeeze(-1), Bm, Cm, chunk_size=int(os.environ.get("POINT_MOE_SSD_CHUNK", "128") or 128),
+            D=D, z=None, dt_bias=delta_bias, dt_softplus=delta_softplus)
+        return y.squeeze(-1).transpose(1, 2)                     # (B,D,L)
     if backend in ("auto", "cuda"):
         try:
             from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
