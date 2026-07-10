@@ -148,3 +148,19 @@ IWE, and the Hilbert/Z complementary orders.
   POINT_MOE_CONV_CKPT=0 disables. Note the SSD scan already ships group-level
   checkpointing (POINT_MOE_SSD_CKPT=1 default) -- the 'level below layer'
   now covers both of the model's largest saved tensors.
+
+## r8 changes (2026-07-10) -- exact-memory engineering for 512k on 16 GB
+
+* Selective scan (`ssm.py`): both pure-torch backends (`ref`, `ssd`) accept
+  `h0` and `return_last_state`. Verified: full scan == two stitched half-scans
+  in outputs AND final state (ref 2e-7, ssd 9e-6).
+* BiMamba: `POINT_MOE_SEQ_SLICE=<tokens>` runs each direction's scan in
+  checkpointed sequence slices with exact (B, half, N) state carry; the fp32
+  scan stream tensors (the largest per-segment allocation) become slice-sized.
+  Gradients flow through the carried state (exact BPTT). Verified sliced ==
+  unsliced to ~2e-10 in outputs and every gradient path, for 2- and
+  4-direction, d_state 1 and 4. Convs/in_proj stay full-length (cheap, and
+  slicing them would need halos); train-time only.
+* Trainer: `POINT_MOE_EMPTY_CACHE_EVERY=K` releases cached allocator blocks
+  every K optimizer steps (Windows has no expandable_segments; long runs
+  fragment reserved memory).

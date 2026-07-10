@@ -37,6 +37,7 @@ so the backbone is inherently micro-batch-1 / grad-accum safe.
 from __future__ import annotations
 
 import math
+import os
 from collections import OrderedDict
 from functools import partial
 
@@ -188,16 +189,39 @@ class BiMamba(nn.Module):
                                  torch.arange(1, L, 2, device=xi.device)]).flip(0)
                 xi, zi = self._reindex(xi, idx), self._reindex(zi, idx)
 
-            x_dbl = self.x_projs[i](xi.transpose(1, 2).reshape(B * L, self.half))
-            dt, Bp, Cp = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-            dt = self.dt_projs[i](dt).reshape(B, L, self.half).transpose(1, 2).contiguous()  # (B,half,L)
-            Bp = Bp.reshape(B, L, self.d_state).transpose(1, 2).contiguous()                 # (B,N,L)
-            Cp = Cp.reshape(B, L, self.d_state).transpose(1, 2).contiguous()
             A = -torch.exp(self.A_logs[i].float())                                           # (half,N)
 
-            yi = selective_scan(xi, dt, A, Bp, Cp, self.Ds[i].float(), z=None,
-                                delta_bias=self.dt_projs[i].bias.float(),
-                                delta_softplus=True, backend=self.ssm_backend)               # (B,half,L)
+            def _proj_scan(xi_s, h_in, _i=i):
+                # pointwise projections + scan on one sequence slice; EXACT under
+                # slicing because the state h is carried across slice boundaries.
+                Ls = xi_s.shape[-1]
+                x_dbl = self.x_projs[_i](xi_s.transpose(1, 2).reshape(B * Ls, self.half))
+                dt, Bp, Cp = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                dt = self.dt_projs[_i](dt).reshape(B, Ls, self.half).transpose(1, 2).contiguous()
+                Bp = Bp.reshape(B, Ls, self.d_state).transpose(1, 2).contiguous()
+                Cp = Cp.reshape(B, Ls, self.d_state).transpose(1, 2).contiguous()
+                return selective_scan(xi_s, dt, A, Bp, Cp, self.Ds[_i].float(), z=None,
+                                      delta_bias=self.dt_projs[_i].bias.float(),
+                                      delta_softplus=True, backend=self.ssm_backend,
+                                      h0=h_in, return_last_state=True)
+
+            slice_len = int(os.environ.get("POINT_MOE_SEQ_SLICE", "0"))
+            if slice_len > 0 and L > slice_len and torch.is_grad_enabled() and xi.requires_grad:
+                # LEVEL-BELOW-'layer', part 2 (accuracy-exact): the scan's fp32 stream
+                # tensors are the largest per-segment allocation; slicing the sequence
+                # with checkpointed slices + exact (B,half,N) state carry makes them
+                # slice-sized. Gradients flow through the carried state (exact BPTT).
+                from torch.utils.checkpoint import checkpoint as _ckpt
+                h = xi.new_zeros((B, self.half, self.d_state), dtype=torch.float32)
+                y_parts = []
+                for s0 in range(0, L, slice_len):
+                    e0 = min(s0 + slice_len, L)
+                    y_s, h = _ckpt(_proj_scan, xi[:, :, s0:e0].contiguous(), h,
+                                   use_reentrant=False)
+                    y_parts.append(y_s)
+                yi = torch.cat(y_parts, dim=-1)                                              # (B,half,L)
+            else:
+                yi, _ = _proj_scan(xi, None)                                                 # (B,half,L)
 
             if i == 1:
                 yi, zi = yi.flip(-1), zi.flip(-1)

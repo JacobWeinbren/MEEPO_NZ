@@ -126,6 +126,16 @@ def load_pretrained(model, path, verbose=True):
 
 
 class Trainer:
+    def _maybe_empty_cache(self):
+        # Windows lacks expandable_segments; long runs fragment the caching allocator.
+        # POINT_MOE_EMPTY_CACHE_EVERY=K releases cached blocks every K optimizer steps
+        # (0/unset = off). Costs a sync; saves reserved-memory creep on 16 GB cards.
+        import os as _os
+        k = int(_os.environ.get("POINT_MOE_EMPTY_CACHE_EVERY", "0") or 0)
+        self._opt_steps_done = getattr(self, "_opt_steps_done", 0) + 1
+        if k and torch.cuda.is_available() and self._opt_steps_done % k == 0:
+            torch.cuda.empty_cache()
+
     def __init__(self, model, cfg, train_set, val_set, collate, vis_set=None,
                  device: Optional[torch.device] = None):
         self.cfg = cfg
@@ -809,9 +819,11 @@ class Trainer:
                             else:
                                 nonfinite += 1            # non-finite grads -> skip the step
                             self.scaler.update()
+                            self._maybe_empty_cache()
                         else:
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
+                            self._maybe_empty_cache()
                     if win_bwd and getattr(self, "_onecycle_pmoe", False) and \
                        self.scheduler is not None and self._oc_step < self._oc_total:
                         self.scheduler.step()             # OneCycle steps per optimiser step

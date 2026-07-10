@@ -45,7 +45,8 @@ def kernel_available() -> bool:
 
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None,
-                       delta_bias=None, delta_softplus=False):
+                       delta_bias=None, delta_softplus=False,
+                       h0=None, return_last_state=False):
     """Pure-PyTorch selective scan. Differentiable, device-agnostic.
 
     Mirrors mamba_ssm's reference implementation (selective_scan_ref): discretize
@@ -71,7 +72,7 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None,
     else:                                              # (D, N) time-invariant
         deltaB_u = torch.einsum("bdl,dn,bdl->bdln", delta, B.float(), u)
 
-    x = u.new_zeros((batch, dim, n))
+    x = u.new_zeros((batch, dim, n)) if h0 is None else h0.float()
     ys = []
     for t in range(seqlen):
         x = deltaA[:, :, t] * x + deltaB_u[:, :, t]    # (B, D, N)
@@ -86,7 +87,8 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None,
         y = y + u * D.float()[None, :, None]
     if z is not None:
         y = y * F.silu(z.float())
-    return y.to(dtype_in)
+    y = y.to(dtype_in)
+    return (y, x) if return_last_state else y
 
 
 _SSM_BACKEND_REPORTED = False
@@ -193,7 +195,8 @@ def _discretize(u, delta, A, B, delta_bias, delta_softplus):
 
 
 def selective_scan_ssd(u, delta, A, B, C, D=None, z=None,
-                       delta_bias=None, delta_softplus=False, chunk=None):
+                       delta_bias=None, delta_softplus=False, chunk=None,
+                       h0=None, return_last_state=False):
     """Chunked selective scan -- the Mamba-2 SSD algorithm (Dao & Gu 2024, 'Transformers
     are SSMs') applied to our Mamba-1 recurrence, in pure PyTorch.
 
@@ -274,7 +277,7 @@ def selective_scan_ssd(u, delta, A, B, C, D=None, z=None,
 
     # Sequential part: ONLY the tiny (B,D,N) carry recurrence over nc chunks
     # (h_out[k] = a_chunk[k]*h_in[k] + intra_last[k]); ~1 fused op per chunk.
-    h = u.new_zeros((batch, dim, n))
+    h = u.new_zeros((batch, dim, n)) if h0 is None else h0.float()
     h_ins = []
     for k in range(nc):
         h_ins.append(h)
@@ -292,11 +295,15 @@ def selective_scan_ssd(u, delta, A, B, C, D=None, z=None,
         y = y + u * D.float()[None, :, None]
     if z is not None:
         y = y * F.silu(z.float())
-    return y.to(dtype_in)
+    y = y.to(dtype_in)
+    # h after the carry loop is the exact final state: padded tail chunks are
+    # inert (decay exp(0)=1, input 0), so they pass the state through unchanged.
+    return (y, h) if return_last_state else y
 
 
 def selective_scan(u, delta, A, B, C, D=None, z=None,
-                   delta_bias=None, delta_softplus=False, backend="auto"):
+                   delta_bias=None, delta_softplus=False, backend="auto",
+                   h0=None, return_last_state=False):
     """Backend-dispatching selective scan. See module docstring for semantics.
 
     auto  -> fused mamba_ssm CUDA kernel if importable, else the chunked SSD scan
@@ -307,6 +314,14 @@ def selective_scan(u, delta, A, B, C, D=None, z=None,
     global _SSM_BACKEND_REPORTED
     if backend not in ("auto", "cuda", "ssd", "torch", "ref"):
         raise ValueError(f"unknown ssm backend {backend!r}")
+    if h0 is not None or return_last_state:
+        # exact state carry (sequence slicing) is served by the pure-torch backends;
+        # the fused kernel path is not extended. Same math either way (verified).
+        picked = "ssd" if u.is_cuda else "ref"
+        fn = selective_scan_ssd if picked == "ssd" else selective_scan_ref
+        return fn(u, delta, A, B, C, D=D, z=z, delta_bias=delta_bias,
+                  delta_softplus=delta_softplus, h0=h0,
+                  return_last_state=return_last_state)
     if backend in ("auto", "cuda"):
         try:
             from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
