@@ -1,12 +1,8 @@
-cd %USERPROFILE%\meepo_nz           
-pip install triton-windows einops transformers packaging
-pip install --no-deps -e third_party\mamba-main
-pip install --no-deps -e .
-python -c "from mamba_ssm.modules.mamba3 import Mamba3; print('mamba3 OK')"
-python scripts\smoke_vm3.py         
+python scripts\02_build_prior_raster.py --project-dir "C:\Users\jweinbren\Desktop\TRAINING DATA" --root data\official --epsg 27700 --workers 12
 
-set POINT_MOE_DISABLE_SPCONV=1
-python scripts\probe_vram.py --synthetic --points 102400 --amp bf16 --granularity block --iters 3 --backbone vm3 --ssm-backend cuda
+python scripts\04_preprocess.py --root data\official --out data\official\tiles --dl 0.1 --in-radius 6 --workers 12 --unclassified-classes 0
+
+python scripts\12_label_audit.py --tiles data\official\tiles
 
 set POINT_MOE_DISABLE_SPCONV=1
 python scripts\05_train.py --tiles data\official\tiles --scene-mode --backbone vm3 --dl 0.1 ^
@@ -15,11 +11,11 @@ python scripts\05_train.py --tiles data\official\tiles --scene-mode --backbone v
   --epochs 50 --epoch-steps 232 ^
   --lr 0.002 --weight-decay 0.005 --lr-schedule cosine --warmup-epochs 2 ^
   --resplit-seed 42 ^
-  --vm3-no-cpe --vm3-enc-depths 1,1,2,2 ^
+  --vm3-no-cpe ^
   --scene-val-tiles 16 --n-vis-tiles 6 ^
   --refine spag_dc --spag-learned --spag-rl ^
   --spag-rl-every 20 --spag-rl-max-points 30000 --spag-rl-reward rmse ^
   --spag-rl-eval-every 200 --spag-rl-eval-tiles 12 ^
   --no-augment-tilt --no-augment-elastic --no-dropout ^
   --checkpoint-granularity block ^
-  --tta --device cuda --out-dir runs --name official_vm3_v1 --log-every 5 --scene-vote-step 50
+  --tta --device cuda --out-dir runs --name official_vm3_v2 --log-every 5 --scene-vote-step 50
