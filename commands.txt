@@ -5,10 +5,10 @@ pip install --no-deps -e .
 python -c "from mamba_ssm.modules.mamba3 import Mamba3; print('mamba3 OK')"
 python scripts\smoke_vm3.py         
 
-set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+set POINT_MOE_DISABLE_SPCONV=1
 python scripts\probe_vram.py --synthetic --points 102400 --amp bf16 --granularity block --iters 3 --backbone vm3 --ssm-backend cuda
 
-set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+set POINT_MOE_DISABLE_SPCONV=1
 python scripts\05_train.py --tiles data\official\tiles --scene-mode --backbone vm3 --dl 0.1 ^
   --ssm-backend cuda ^
   --scene-max-points 102400 --batch-num 1 --accum-steps 12 --num-workers 12 ^
