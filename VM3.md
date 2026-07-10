@@ -112,3 +112,28 @@ IWE, and the Hilbert/Z complementary orders.
 * Windows note: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is a
   Linux-only allocator feature; on Windows it emits a UserWarning and does
   nothing — omit it there.
+
+## r5 changes (2026-07-10)
+
+* `--mamba-directions {1,2,4}` CLI flag for the MEEPO backbone. 2 (default) =
+  the released zip's hardcoded bidirectional loop; 4 = the paper's
+  Bidirectional Strided SSM (Fig. 6b / Tab. 7d-e). Note the zip's strided
+  branches are unreachable dead code with a non-permutation index; our
+  4-direction path implements the paper's stated 1,3,5,2,4,6 semantics with an
+  exact argsort inverse. Verified: the backward direction's gate/output
+  flip-back matches the official code (z flipped pre-scan AND post-scan).
+
+## r6 changes (2026-07-10)
+
+* CRITICAL FIX: `scripts/04_preprocess.py` was TRUNCATED at the job-building
+  step in every zip so far -- including the original `meepo_3_nz.zip` this
+  package was built from. It defined the workers, built the job list, chose
+  the grid... and ended: no dispatch, no writes, no `__main__` guard, so it
+  ran silently and produced zero tiles. The dispatch tail is reconstructed
+  against the intact worker functions (`_preprocess_one`, `_assign_splits`,
+  `compute_norm_stats`) with spawn-safe multiprocessing, per-cloud progress,
+  a split/failure summary, and fail-fast diagnostics: manifest pair/cloud
+  counts, missing-source-path detection (manifest paths point at the ORIGINAL
+  project folder by design), and hard errors instead of silent no-ops.
+  Verified end-to-end on synthetic EA-convention LAS (class 1 = non-ground
+  via `--unclassified-classes 0`) through 04 and the label audit.

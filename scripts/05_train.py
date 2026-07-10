@@ -244,6 +244,11 @@ def main():
                          "[diag] train/val class balance agrees, then keep it fixed for this dataset.")
     ap.add_argument("--resplit-val-frac", type=float, default=None, help="Resplit val fraction (default 0.1).")
     ap.add_argument("--resplit-test-frac", type=float, default=None, help="Resplit test fraction (default 0.1).")
+    ap.add_argument("--mamba-directions", type=int, default=None, choices=[1, 2, 4],
+                    help="MEEPO scan directions: 2 = bidirectional (the RELEASED code's hardcoded loop), "
+                         "4 = + stride-2 forward/backward (the PAPER's Bidirectional Strided SSM, Fig.6b/Tab.7e; "
+                         "the zip's strided branches are dead code with a non-permutation index -- ours implements "
+                         "the paper's 1,3,5,2,4,6 semantics).")
     ap.add_argument("--meepo3-state", type=int, default=None,
                     help="MEEPO-3 mixer d_state (default 4 = two complex pairs; even, or 1 for the RoPE-free graded mode).")
     ap.add_argument("--pointssm-state", type=int, default=None,
@@ -422,6 +427,8 @@ def main():
         cfg.pointssm_state = args.pointssm_state
     if args.meepo3_state is not None:
         cfg.meepo3_state = args.meepo3_state
+    if args.mamba_directions is not None:
+        cfg.mamba_directions = int(args.mamba_directions)
     # ---- VM3 (VoxelMamba-3) knob mapping (attributes are read via getattr) ----
     def _csv_int(s):
         return tuple(int(v) for v in str(s).split(",") if v != "")

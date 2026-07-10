@@ -282,3 +282,78 @@ def main():
 
     # size the input cylinder to the conv reach (auto_in_radius) now that dl is final
     cfg.resolve_geometry()
+
+    # ------------------------------------------------------------------ #
+    #  Fail-fast manifest diagnostics, split assignment, dispatch, stats.
+    #  (Reconstructed 2026-07-10: the shipped file was truncated here --
+    #  it built `jobs` and then fell off the end, so stage 04 exited
+    #  silently having written nothing. This tail restores the pipeline
+    #  and makes every previously-silent branch loud.)
+    # ------------------------------------------------------------------ #
+    n_pairs = len(manifest.get("pairs", []))
+    print(f"[04] manifest: {n_pairs} pairs, {len(jobs)} clouds -> out {out_dir}")
+    if not jobs:
+        sys.exit("[04] ERROR: the manifest lists NO clouds (manifest['pairs'][*]['clouds'] "
+                 "is empty). Re-run stage 02 (or 01) with the correct --project-dir; "
+                 f"manifest inspected: {man_path or args.input_dir}")
+    missing = [c for c, _, _, _ in jobs if not os.path.exists(c)]
+    if missing:
+        print(f"[04] WARNING: {len(missing)}/{len(jobs)} manifest cloud paths do not exist "
+              f"(first: {missing[0]!r}). The manifest stores SOURCE paths as found by stage "
+              f"02 (e.g. under your --project-dir). If the folder moved/renamed, re-run stage 02.")
+    if len(missing) == len(jobs):
+        sys.exit("[04] ERROR: none of the manifest cloud paths exist on this machine. Aborting.")
+
+    splits = _assign_splits(len(jobs), cfg, seed=0)
+    tasks = [(c, pp, rp, str(splits[k]), out_dir, cfg, 1000 + k)
+             for k, (c, pp, rp, _pid) in enumerate(jobs)]
+
+    workers = max(1, int(args.workers)) if args.workers else max(1, (os.cpu_count() or 2) - 1)
+    print(f"[04] preprocessing {len(tasks)} clouds with {workers} workers "
+          f"(ground={tuple(cfg.ground_classes)} ignore={tuple(cfg.unclassified_classes)} "
+          f"dl={cfg.first_subsampling_dl}) ...")
+
+    results = []
+    if workers <= 1:
+        for k, t in enumerate(tasks):
+            results.append(_preprocess_one(t))
+            name, split, n, has_prior, failed = results[-1]
+            print(f"[04] ({k + 1}/{len(tasks)}) {name}: "
+                  f"{'FAILED/MISSING' if failed else f'n={n}'} split={split} "
+                  f"prior={'yes' if has_prior else 'NO'}")
+    else:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")            # Windows-safe; matches historical behaviour
+        with ctx.Pool(processes=workers) as pool:
+            # tasks stay pair-ordered so each worker's raster cache sees runs of
+            # clouds sharing one prior (see the per-worker cache note above).
+            for k, res in enumerate(pool.imap(_preprocess_one, tasks, chunksize=1)):
+                results.append(res)
+                name, split, n, has_prior, failed = res
+                print(f"[04] ({k + 1}/{len(tasks)}) {name}: "
+                      f"{'FAILED/MISSING' if failed else f'n={n}'} split={split} "
+                      f"prior={'yes' if has_prior else 'NO'}", flush=True)
+
+    ok = [r for r in results if not r[4]]
+    bad = [r for r in results if r[4]]
+    from collections import Counter
+    by_split = Counter(r[1] for r in ok)
+    print(f"[04] done: {len(ok)}/{len(results)} clouds tiled "
+          f"(train={by_split.get('train', 0)} val={by_split.get('val', 0)} "
+          f"test={by_split.get('test', 0)}); {len(bad)} failed/missing"
+          + (f" (first: {bad[0][0]})" if bad else ""))
+    if not ok:
+        sys.exit("[04] ERROR: zero tiles written. Nothing to train on.")
+
+    try:
+        stats = compute_norm_stats(out_dir, cfg)
+        print(f"[04] wrote {os.path.join(out_dir, 'norm_stats.json')} "
+              f"({len(stats.get('mean', []))} feature channels)")
+    except Exception as e:
+        print(f"[04] norm-stats skipped ({type(e).__name__}: {e}); stage 05 recomputes it in place.")
+
+    print(f"[04] next: python scripts/12_label_audit.py --tiles {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
