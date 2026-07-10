@@ -742,6 +742,9 @@ class Trainer:
                 "reclass": float(np.mean(rec))}
 
     # ------------------------------------------------------------------- train
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # drop eval-shape pool blocks (staircase fix)
+
     def train(self, epochs: Optional[int] = None):
         epochs = epochs or self.cfg.epochs
         train_loader, val_loader = self._loaders()
@@ -791,7 +794,9 @@ class Trainer:
 
                 with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                     import contextlib as _ctx
-                    _off = (torch.autograd.graph.save_on_cpu(pin_memory=True)
+                    import os as _os
+                    _off = (torch.autograd.graph.save_on_cpu(
+                                pin_memory=_os.environ.get("POINT_MOE_OFFLOAD_PIN", "1") != "0")
                             if getattr(self.cfg, "offload_activations", False)
                             and torch.cuda.is_available() else _ctx.nullcontext())
                     with _off:
@@ -910,9 +915,8 @@ class Trainer:
 
             if not getattr(self, "_onecycle_pmoe", False):
                 self.scheduler.step()                     # per-epoch schedulers (cosine/exp/kpx)
-            if torch.cuda.is_available() and int(__import__("os").environ.get(
-                    "POINT_MOE_EMPTY_CACHE_EVERY", "0") or 0):
-                torch.cuda.empty_cache()          # epoch boundary: drop stale-shape pool blocks
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()          # epoch boundary: drop inference-shape pool blocks
             train_metrics = conf.compute()
             train_loss = running / max(n_iter - nonfinite, 1)
             if nonfinite:

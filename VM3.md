@@ -205,3 +205,16 @@ IWE, and the Hilbert/Z complementary orders.
   box first (rel < 5e-3 gate). Fails loudly if Triton ops are unavailable.
 * WSL2 recipe (see chat): Ubuntu + CUDA + expandable_segments:True cures the
   variable-shape allocator-pool growth that native Windows cannot.
+
+## r13 changes (2026-07-10) -- staircase fix
+
+* torch.cuda.empty_cache() now runs UNCONDITIONALLY after epoch validation and
+  after every SPAG-RL holdout eval. Diagnosis: with --offload-activations the
+  train loop's GPU footprint is small and flat; the observed permanent +GB
+  step-ups coincide with the periodic INFERENCE events (--spag-rl-eval-every
+  and epoch validation) whose whole-tile no_grad shapes minted pool blocks
+  that were never released. Flushing at those two boundaries costs ~ms at
+  their cadence and removes the ratchet.
+* POINT_MOE_OFFLOAD_PIN=0 disables pinned staging in --offload-activations
+  (variable shapes can also grow the cached PINNED HOST pool; unpinned is
+  slower to transfer but cannot ratchet).
