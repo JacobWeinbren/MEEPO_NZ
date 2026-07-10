@@ -164,3 +164,14 @@ IWE, and the Hilbert/Z complementary orders.
 * Trainer: `POINT_MOE_EMPTY_CACHE_EVERY=K` releases cached allocator blocks
   every K optimizer steps (Windows has no expandable_segments; long runs
   fragment reserved memory).
+
+## r9 changes (2026-07-10)
+
+* BiMamba per-DIRECTION checkpointing (POINT_MOE_DIR_CKPT=1 default, engages
+  when L > POINT_MOE_DIR_CKPT_MIN_L=32768 under grad): each scan direction's
+  internals (conv1d outputs, SiLUs, reorder copies, gate stream, scan slices)
+  are recomputed in backward; only (x, z) and the direction's (y, z) outputs
+  stay saved. Nested with the r8 sequence slicing; verified exact to ~5e-10
+  in outputs and all gradient paths for 2- and 4-direction configs. This is
+  the last identifiable exact-memory lever in the mixer: what remains saved
+  per mixer is the in_proj output plus 4 tensors per direction of outputs.

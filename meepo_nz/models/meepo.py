@@ -174,7 +174,31 @@ class BiMamba(nn.Module):
         x, z = xz.chunk(2, dim=1)                            # each (B, half, L)
 
         ys, zs = [], []
+        use_dir_ckpt = (torch.is_grad_enabled() and x.requires_grad
+                        and L > int(os.environ.get("POINT_MOE_DIR_CKPT_MIN_L", "32768"))
+                        and os.environ.get("POINT_MOE_DIR_CKPT", "1") != "0")
         for i in range(self.n_directions):
+            if use_dir_ckpt:
+                # LEVEL-BELOW-'layer', part 3 (accuracy-exact): recompute this whole
+                # direction's internals (convs, SiLUs, reorder copies, scan slices)
+                # in backward; only (x, z) and the direction's outputs stay saved.
+                from torch.utils.checkpoint import checkpoint as _ckpt
+                yi, zi = _ckpt(self._direction, x, z,
+                               torch.tensor(i), use_reentrant=False)
+                ys.append(yi)
+                zs.append(zi)
+                continue
+            yi, zi = self._direction(x, z, torch.tensor(i))
+            ys.append(yi)
+            zs.append(zi)
+
+        y = torch.cat([sum(ys), sum(zs)], dim=1)             # (B, d_inner, L)
+        return self.out_proj(y.transpose(1, 2))              # (B, L, D)
+
+    def _direction(self, x, z, i_t):
+        i = int(i_t)
+        B, L = x.shape[0], x.shape[-1]
+        if True:
             xi = F.silu(self.conv1d_xs[i](x))                # (B, half, L)
             zi = F.silu(self.conv1d_zs[i](z))
             idx = None
@@ -228,11 +252,7 @@ class BiMamba(nn.Module):
             elif i in (2, 3):
                 rev = torch.argsort(idx)
                 yi, zi = self._reindex(yi, rev), self._reindex(zi, rev)
-            ys.append(yi)
-            zs.append(zi)
-
-        y = torch.cat([sum(ys), sum(zs)], dim=1)             # (B, d_inner, L)
-        return self.out_proj(y.transpose(1, 2))              # (B, L, D)
+            return yi, zi
 
 
 class SerializedMamba(PointModule):
