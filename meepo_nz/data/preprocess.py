@@ -53,7 +53,7 @@ def preprocess_points(
     if cKDTree is None:
         raise RuntimeError("scipy is required for preprocessing")
     n_raw = xyz.shape[0]
-    if n_raw < int(cfg.sphere_min_points):
+    if n_raw < int(cfg.tile_stats_min_points):
         return 0
     labels_all = label_from_classification(
         classification,
@@ -81,7 +81,7 @@ def preprocess_points(
     sub_int = sub_feat[:, 2]                  # intensity
     sub_ratio = sub_feat[:, 3]                # mean per-point return ratio
     n = sub_xyz.shape[0]
-    if n < int(cfg.sphere_min_points):
+    if n < int(cfg.tile_stats_min_points):
         return 0
 
     # subsampled ASPRS class code (nearest full-res point) - only for scene class
@@ -116,8 +116,8 @@ def preprocess_points(
 
     # ---- candidate sphere centres: snap a regular grid to nearest sub point ----
     tree2d = cKDTree(sub_xyz[:, :2])
-    R = float(cfg.in_radius)
-    s = float(cfg.sphere_center_spacing)
+    R = float(cfg.tile_stats_radius)
+    s = float(cfg.tile_stats_spacing)
     xs = np.arange(sub_xyz[:, 0].min(), sub_xyz[:, 0].max() + 1e-6, s)
     ys = np.arange(sub_xyz[:, 1].min(), sub_xyz[:, 1].max() + 1e-6, s)
     # ``cyl`` keeps, per accepted candidate, the indices of the sub-points inside
@@ -133,7 +133,7 @@ def preprocess_points(
                 continue
             cpt = sub_xyz[ci]
             sph = np.asarray(tree2d.query_ball_point(cpt[:2], R), dtype=np.int64)  # cylinder (XY disc)
-            if sph.size < int(cfg.sphere_min_points):
+            if sph.size < int(cfg.tile_stats_min_points):
                 continue
             seen.add(ci)
             centers.append((cpt - file_origin).astype(np.float32))
@@ -141,7 +141,7 @@ def preprocess_points(
     if not centers:                                   # fallback: one centre at centroid
         ci = int(tree2d.query([sub_xyz[:, 0].mean(), sub_xyz[:, 1].mean()], k=1)[1])
         sph = np.asarray(tree2d.query_ball_point(sub_xyz[ci][:2], R), dtype=np.int64)
-        if sph.size < int(cfg.sphere_min_points):     # tiny tile: whole cloud is the cylinder
+        if sph.size < int(cfg.tile_stats_min_points):     # tiny tile: whole cloud is the cylinder
             sph = np.arange(n, dtype=np.int64)
         centers = [(sub_xyz[ci] - file_origin).astype(np.float32)]
         cyl = [np.sort(sph).astype(np.int32)]
@@ -154,14 +154,17 @@ def preprocess_points(
                 else np.zeros(0, dtype=np.int32))
 
     # ---- previous-year CLASSIFICATION raster (Deviation A), stored per tile ----
-    # Crop the whole-region/per-cloud prior raster to THIS tile's extent (+in_radius
-    # margin so edge-sphere patches are covered) and block-mean downsample to
-    # dtm_store_res (default 1 m); the network samples only a small patch per sphere.
+    # Crop the whole-region/per-cloud prior raster to THIS tile's extent plus a fixed
+    # PRIOR margin so blocks at the tile edge still see prior coverage, then block-mean
+    # downsample to dtm_store_res (default 1 m); the network samples only a small patch
+    # per block. The margin is deliberately INDEPENDENT of in_radius (a sphere-mode
+    # receptive-field knob with no business shaping scene-mode tiles) and matches the
+    # stage-02 mosaic crop margin. Override via cfg.prior_crop_margin.
     prior_data = None
     prior_geo = None
     use_rast = bool(getattr(cfg, "use_dtm_raster", False))
     if use_rast and (prev_prior is not None or prev_dtm is not None):
-        R = float(cfg.in_radius)
+        R = float(getattr(cfg, "prior_crop_margin", 25.0))
         x0w, y0w = float(file_origin[0]), float(file_origin[1])
         x1w = x0w + float(local[:, 0].max())
         y1w = y0w + float(local[:, 1].max())

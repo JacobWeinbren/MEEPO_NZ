@@ -20,6 +20,8 @@ from collections import OrderedDict
 from typing import List, Optional
 
 import numpy as np
+
+from .splitting import effective_split
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 
@@ -83,8 +85,8 @@ class SphereDataset(Dataset):
         if augment is None:
             augment = (split == "train") and bool(getattr(cfg, "use_augmentation", False))
         self.augment = augment
-        self.R = float(cfg.in_radius)
-        self.min_pts = int(cfg.sphere_min_points)
+        self.R = float(getattr(cfg, 'tile_stats_radius', 6.0))
+        self.min_pts = int(getattr(cfg, 'tile_stats_min_points', 100))
 
         files = sorted(glob.glob(os.path.join(tile_dir, "*.npz")))
         # Optional TRAIN-tile subset (cfg.max_train_tiles): cap how many train tiles are
@@ -98,7 +100,7 @@ class SphereDataset(Dataset):
             for f in files:
                 try:
                     with np.load(f, allow_pickle=True) as d:
-                        if (str(d["split"]) if "split" in d else "train") == "train":
+                        if effective_split(f, str(d["split"]) if "split" in d else "train", cfg) == "train":
                             train_files.append(f)
                 except Exception:
                     pass
@@ -116,6 +118,7 @@ class SphereDataset(Dataset):
             try:
                 d = np.load(f, allow_pickle=True)
                 fsplit = str(d["split"]) if "split" in d else "train"
+                fsplit = effective_split(f, fsplit, cfg)   # --resplit-seed override
                 if split is not None and fsplit != split:
                     continue
                 centers = d["centers"].astype(np.float32)

@@ -2,7 +2,7 @@
 """
 05 - Train MEEPO (PTv3 + sparse MoE) on the preprocessed New Zealand tiles.
 
-Builds the train / val / test ``SphereDataset`` splits, the PTv3 collate, the
+Builds the train / val / test ``SceneDataset`` splits, the PTv3 collate, the
 MEEPO model (clean PyTorch: no spconv / flash-attn / torch_scatter), and runs
 the SAME ``Trainer`` as the original pipeline - so the progress bars, per-epoch
 error images, classified-LAZ gallery, and training dashboard are unchanged.
@@ -28,7 +28,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from meepo_nz.utils.config import Config
 from meepo_nz.models import build_meepo
-from meepo_nz.data.dataset import SphereDataset
 from meepo_nz.data.ptv3_collate import PTv3Collate
 from meepo_nz.training.trainer import Trainer
 
@@ -60,8 +59,6 @@ def main():
                     help="Gradient accumulation: micro-batches per optimiser step. Effective batch = "
                          "batch_num * accum_steps. Use --batch-num 4 --accum-steps 4 to train at the "
                          "paper's batch 16 when 16 blocks OOM on one GPU (= the paper's cross-GPU averaging).")
-    ap.add_argument("--sphere-mode", action="store_true",
-                    help="Use the LEGACY KPConv sphere dataset instead of full-scene PTv3.")
     ap.add_argument("--scene-mode", action="store_true",
                     help="Force PTv3-native whole-scene training (the default). Use to override a stale "
                          "data/<tiles>/config.used.yaml snapshot still set to scene_mode=false, without re-running stage 04.")
@@ -134,8 +131,6 @@ def main():
     ap.add_argument("--spag-rl-eval-max-points", type=int, default=None,
                     help="Per-cloud subsample cap for the held-out eval (default 80000; 0 = all). The 1 m DEM is "
                          "resolution-limited so this is accuracy-safe and keeps the eval fast.")
-    ap.add_argument("--fixed-batch", action="store_true",
-                    help="Disable variable point-budget batching; use a fixed batch_num spheres.")
     ap.add_argument("--no-grad-checkpoint", action="store_true",
                     help="Disable PTv3 activation checkpointing (uses more VRAM, somewhat faster).")
     ap.add_argument("--checkpoint-granularity", choices=["stage", "block", "layer"], default=None,
@@ -143,7 +138,7 @@ def main():
                          "block's xCPE/Mamba/MLP separately = lowest activation peak, for small-VRAM cards (e.g. 16 GB); "
                          "'stage' recomputes a whole stage at once = least recompute but highest peak (needs headroom).")
     ap.add_argument("--grad-checkpoint", action="store_true",
-                    help="Force activation checkpointing ON in sphere mode (only needed for very large in_radius).")
+                    help="Force activation checkpointing ON (default already on in scene mode).")
     ap.add_argument("--batch-limit", type=int, default=None,
                     help="Total input points per variable batch (0 = auto-calibrate).")
     ap.add_argument("--mix-prob", type=float, default=None,
@@ -155,6 +150,10 @@ def main():
                     help="Enable MEEPO x/y micro-tilt (sets augment_tilt_xy=pi/64). OFF by default: desyncs the 2D georeferenced prior.")
     ap.add_argument("--augment-elastic", action="store_true",
                     help="Enable MEEPO ElasticDistortion. OFF by default: warps the ground surface (~1.6 m) and desyncs the prior.")
+    ap.add_argument("--no-augment-tilt", action="store_true",
+                    help="Disable the x/y tilt augmentation (sets augment_tilt_xy=0; departs from the MEEPO official config, protects prior-patch alignment).")
+    ap.add_argument("--no-augment-elastic", action="store_true",
+                    help="Disable ElasticDistortion (departs from the MEEPO official config, protects prior-patch alignment).")
     ap.add_argument("--scene-cache-tiles", type=int, default=None,
                     help="Per-worker LRU tile cache size (default 4). Lower (1-2) to cut host RAM; each cached tile is large.")
     ap.add_argument("--prefetch-factor", type=int, default=None,
@@ -175,6 +174,16 @@ def main():
     ap.add_argument("--warmup-epochs", type=int, default=None, help="Linear LR warmup epochs before cosine.")
     ap.add_argument("--no-intensity-log", action="store_true", help="Skip log1p on intensity (plain z-score).")
     ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--init-from", default=None,
+                    help="Transfer init: load MODEL WEIGHTS ONLY from a checkpoint (model_best.pt / "
+                         "model_final.pt or a raw state_dict) before training -- optimizer, scheduler "
+                         "and epoch start fresh. Use to pretrain on a large corpus (e.g. NZ) and "
+                         "fine-tune on a small one (e.g. British EA tiles), typically with a ~10x "
+                         "lower --lr and --epoch-steps 0.")
+    ap.add_argument("--freeze", default=None,
+                    help="Comma list of parameter-name prefixes to freeze after --init-from (e.g. "
+                         "'embedding,enc'). Frozen params keep pretrained values; the rest fine-tune. "
+                         "Errors if a prefix matches nothing (typo guard).")
     ap.add_argument("--num-workers", type=int, default=None)
     ap.add_argument("--device", default=None, help="cuda | cpu (default: auto).")
     # feature switches (Deviation B lives in these channels)
@@ -199,8 +208,46 @@ def main():
                     help="Disable the GrounDiff-style confidence gating head in the raster branch.")
     ap.add_argument("--no-augment", action="store_true")
     # MEEPO knobs
-    ap.add_argument("--backbone", choices=["meepo"], default="meepo",
-                    help="Backbone: meepo (CNN-Mamba; the only backbone -- PTv3/LitePT+MoE were stripped).")
+    ap.add_argument("--backbone", choices=["meepo", "meepo3", "pointssm", "vm3"], default="meepo",
+                    help="Backbone: meepo (CNN-Mamba, default), meepo3 (MEEPO host + Mamba-3 mixer), "
+                         "pointssm (PointSSM host + Mamba-3 mixer) or vm3 (VoxelMamba-3: group-free "
+                         "whole-scene OFFICIAL multi-head Mamba-3; models/vm3.py; replaces meepo3; NOT "
+                         "--init-from compatible with any other backbone).")
+    # VM3 (VoxelMamba-3) knobs
+    ap.add_argument("--vm3-state", type=int, default=None,
+                    help="VM3 Mamba-3 d_state (default 64; Mamba-3 paper: N=64 matches Mamba-2 N=128).")
+    ap.add_argument("--vm3-headdim", type=int, default=None,
+                    help="VM3 head dim P (default 64, the Mamba-3 native head shape; every stage needs expand*C %% P == 0).")
+    ap.add_argument("--vm3-expand", type=int, default=None, help="VM3 mixer expansion (default 2).")
+    ap.add_argument("--vm3-enc-depths", type=str, default=None,
+                    help="Comma list, e.g. 2,2,2,2 (default). Encoder VM3Blocks per stage.")
+    ap.add_argument("--vm3-enc-channels", type=str, default=None,
+                    help="Comma list, e.g. 128,256,384,512 (default). All widths must be divisible by 32 at expand 2 / headdim 64.")
+    ap.add_argument("--vm3-dec-depths", type=str, default=None, help="Comma list, default 1,1,1.")
+    ap.add_argument("--vm3-dec-channels", type=str, default=None, help="Comma list, default 128,256,384.")
+    ap.add_argument("--vm3-dsb-down", type=str, default=None,
+                    help="Backward-branch DSB strides per stage, comma list, default 1,2,4,4 (Voxel Mamba Tab.6c).")
+    ap.add_argument("--vm3-iwe-window", type=int, default=None,
+                    help="Implicit-window-embedding window size (voxels), default 16.")
+    ap.add_argument("--vm3-no-cpe", action="store_true",
+                    help="Ablation: drop the per-block xCPE subconv (spatial locality then rests on the stem alone).")
+    ap.add_argument("--vm3-no-decay-bands", action="store_true",
+                    help="Ablation: keep the official random per-head dt init instead of local/global log-spaced bands.")
+    ap.add_argument("--vm3-chunk-size", type=int, default=None,
+                    help="Mamba-3 SISO kernel chunk size (default 64, the paper's recommendation).")
+    ap.add_argument("--vm3-mlp-ratio", type=float, default=None, help="SwiGLU hidden ratio (default 3.0).")
+    ap.add_argument("--vm3-drop-path", type=float, default=None, help="Stochastic depth (default: cfg drop_path_rate).")
+    # Runtime split override (no re-preprocessing): deterministic per-cloud hash split.
+    ap.add_argument("--resplit-seed", type=int, default=None,
+                    help="Override the split stored at stage-04 with a deterministic per-cloud hash split "
+                         "(order-independent, stable across runs). Changes val AND test; pick a seed whose "
+                         "[diag] train/val class balance agrees, then keep it fixed for this dataset.")
+    ap.add_argument("--resplit-val-frac", type=float, default=None, help="Resplit val fraction (default 0.1).")
+    ap.add_argument("--resplit-test-frac", type=float, default=None, help="Resplit test fraction (default 0.1).")
+    ap.add_argument("--meepo3-state", type=int, default=None,
+                    help="MEEPO-3 mixer d_state (default 4 = two complex pairs; even, or 1 for the RoPE-free graded mode).")
+    ap.add_argument("--pointssm-state", type=int, default=None,
+                    help="Override PointSSM MambaConv d_state (paper 32; PointSSM Tab.11: 16 costs ~1.2 mIoU). Fallback if the fused kernel misbehaves at N=32 on sm_120.")
     ap.add_argument("--ssm-backend", choices=["auto", "cuda", "ssd", "torch"], default=None,
                     help="MEEPO selective-scan backend: auto=fused mamba_ssm kernel if importable else pure-torch (default); cuda=require the kernel; torch=force pure-torch (exact, slower).")
     ap.add_argument("--no-moe", action="store_true", help="Disable MoE (dense PTv3).")
@@ -262,7 +309,6 @@ def main():
     if args.batch_num is not None:   cfg.batch_num = args.batch_num
     if args.norm is not None:        cfg.norm = args.norm
     if args.accum_steps is not None: cfg.grad_accum_steps = args.accum_steps
-    if args.sphere_mode:             cfg.scene_mode = False
     if args.scene_mode:              cfg.scene_mode = True   # override a stale config.used.yaml snapshot
     if bool(getattr(cfg, "scene_mode", True)):
         # The prior-raster branch (Deviation A) is INTEGRATED into whole-scene mode: the prior
@@ -328,7 +374,6 @@ def main():
     if getattr(args, "spag_rl_eval_every", None) is not None:  cfg.spag_rl_eval_every = int(args.spag_rl_eval_every)
     if getattr(args, "spag_rl_eval_tiles", None) is not None:  cfg.spag_rl_eval_tiles = int(args.spag_rl_eval_tiles)
     if getattr(args, "spag_rl_eval_max_points", None) is not None: cfg.spag_rl_eval_max_points = int(args.spag_rl_eval_max_points)
-    if args.fixed_batch:             cfg.variable_batch = False
     if args.no_grad_checkpoint:      cfg.grad_checkpointing = False
     if getattr(args, "checkpoint_granularity", None) is not None:
         cfg.checkpoint_granularity = str(args.checkpoint_granularity)
@@ -338,6 +383,8 @@ def main():
     if args.no_dropout:              cfg.augment_dropout_prob = 0.0
     if args.augment_tilt:            cfg.augment_tilt_xy = 0.04908738521234052   # MEEPO RandomRotate x/y = pi/64
     if args.augment_elastic:         cfg.augment_elastic = True
+    if args.no_augment_tilt:     cfg.augment_tilt_xy = 0.0
+    if args.no_augment_elastic:  cfg.augment_elastic = False
     if args.scene_cache_tiles is not None: cfg.scene_cache_tiles = int(args.scene_cache_tiles)
     if args.prefetch_factor is not None:   cfg.dataloader_prefetch = int(args.prefetch_factor)
     if bool(getattr(cfg, "use_augmentation", True)):
@@ -352,7 +399,10 @@ def main():
               f"variable_batch={bool(getattr(cfg,'variable_batch',False))} "
               f"grad_checkpointing={bool(getattr(cfg,'grad_checkpointing',True))} "
               f"(per-forward points are capped by scene_max_points; lower it if OOM)")
-    if args.lr is not None:          cfg.learning_rate = args.lr
+    if args.lr is not None:
+        cfg.learning_rate = args.lr
+        cfg.adamw_lr = args.lr          # the optimizer/OneCycle head reads adamw_lr;
+        # setting only learning_rate left the 2026-07-09 run at the 6e-3 default.
     if args.num_workers is not None: cfg.num_workers = args.num_workers
     if args.no_mean_elev:    cfg.use_mean_elevation = False
     if args.no_curvature:    cfg.use_curvature = False
@@ -368,6 +418,41 @@ def main():
     if args.no_augment:      cfg.use_augmentation = False
     if args.backbone is not None:
         cfg.backbone = args.backbone
+    if args.pointssm_state is not None:
+        cfg.pointssm_state = args.pointssm_state
+    if args.meepo3_state is not None:
+        cfg.meepo3_state = args.meepo3_state
+    # ---- VM3 (VoxelMamba-3) knob mapping (attributes are read via getattr) ----
+    def _csv_int(s):
+        return tuple(int(v) for v in str(s).split(",") if v != "")
+    if args.vm3_state is not None:        cfg.vm3_state = args.vm3_state
+    if args.vm3_headdim is not None:      cfg.vm3_headdim = args.vm3_headdim
+    if args.vm3_expand is not None:       cfg.vm3_expand = args.vm3_expand
+    if args.vm3_enc_depths is not None:   cfg.vm3_enc_depths = _csv_int(args.vm3_enc_depths)
+    if args.vm3_enc_channels is not None: cfg.vm3_enc_channels = _csv_int(args.vm3_enc_channels)
+    if args.vm3_dec_depths is not None:   cfg.vm3_dec_depths = _csv_int(args.vm3_dec_depths)
+    if args.vm3_dec_channels is not None: cfg.vm3_dec_channels = _csv_int(args.vm3_dec_channels)
+    if args.vm3_dsb_down is not None:     cfg.vm3_dsb_down = _csv_int(args.vm3_dsb_down)
+    if args.vm3_iwe_window is not None:   cfg.vm3_iwe_window = args.vm3_iwe_window
+    if args.vm3_no_cpe:                   cfg.vm3_use_cpe = False
+    if args.vm3_no_decay_bands:           cfg.vm3_decay_bands = False
+    if args.vm3_chunk_size is not None:   cfg.vm3_chunk_size = args.vm3_chunk_size
+    if args.vm3_mlp_ratio is not None:    cfg.vm3_mlp_ratio = args.vm3_mlp_ratio
+    if args.vm3_drop_path is not None:    cfg.vm3_drop_path = args.vm3_drop_path
+    if args.resplit_seed is not None:
+        cfg.resplit_seed = int(args.resplit_seed)
+        if args.resplit_val_frac is not None:  cfg.resplit_val_frac = float(args.resplit_val_frac)
+        if args.resplit_test_frac is not None: cfg.resplit_test_frac = float(args.resplit_test_frac)
+        print(f"[05] RESPLIT: stored stage-04 split OVERRIDDEN by hash split seed={cfg.resplit_seed} "
+              f"(val={getattr(cfg,'resplit_val_frac',0.1):g}, test={getattr(cfg,'resplit_test_frac',0.1):g}). "
+              f"Val/test differ from previous runs; keep this seed fixed from now on.")
+    if str(getattr(cfg, "backbone", "")).lower() == "vm3":
+        # VM3 stride list must have one fewer entry than enc stages; keep the
+        # generic enc_stride (4 entries for the 5-stage MEEPO) out of its way.
+        if args.vm3_enc_depths is None and not hasattr(cfg, "vm3_enc_depths"):
+            cfg.vm3_enc_depths = (2, 2, 2, 2)
+        n_st = len(tuple(getattr(cfg, "vm3_enc_depths", (2, 2, 2, 2))))
+        cfg.vm3_stride = tuple(getattr(cfg, "vm3_stride", (2,) * (n_st - 1)))
     if args.ssm_backend is not None:
         cfg.ssm_backend = args.ssm_backend
     if args.no_lovasz:
@@ -444,16 +529,12 @@ def main():
         torch.backends.cudnn.benchmark = False
         print("[05] TF32 matmul enabled")
 
-    # PTv3-native full-scene dataset by default; legacy sphere dataset when --sphere-mode.
-    if bool(getattr(cfg, "scene_mode", True)):
-        from meepo_nz.data.scene_dataset import SceneDataset as _DS
-        print("[05] dataset: full-scene (PTv3-native: GridSample + point-budget crop, whole tile / "
-              "large block per sample; no spheres)"
-              + (f"  | prior-raster branch INTEGRATED (per-block GrounDiff CNN)"
-                 if bool(getattr(cfg, "use_dtm_raster", True)) else "  | raster OFF"))
-    else:
-        from meepo_nz.data.dataset import SphereDataset as _DS
-        print("[05] dataset: LEGACY sphere mode (KPConv in_radius cylinders)")
+    # PTv3-native full-scene dataset (the only path; sphere mode removed).
+    from meepo_nz.data.scene_dataset import SceneDataset as _DS
+    print("[05] dataset: full-scene (PTv3-native: GridSample + point-budget crop, whole tile / "
+          "large block per sample)"
+          + (f"  | prior-raster branch INTEGRATED (per-block GrounDiff CNN)"
+             if bool(getattr(cfg, "use_dtm_raster", True)) else "  | raster OFF"))
     train_set = _DS(args.tiles, cfg, split="train")
     val_set = _DS(args.tiles, cfg, split="val")
     test_set = _DS(args.tiles, cfg, split="test")
@@ -476,6 +557,25 @@ def main():
 
     collate = PTv3Collate(cfg, device=None, mix_prob=float(getattr(cfg, "mix_prob", 0.0)))
     model = build_meepo(cfg)
+
+    if getattr(args, "init_from", None):
+        from meepo_nz.training.trainer import load_pretrained
+        load_pretrained(model, args.init_from)
+    if getattr(args, "freeze", None):
+        if not getattr(args, "init_from", None):
+            print("[05] WARNING: --freeze without --init-from freezes RANDOM weights.")
+        for pre in [p.strip() for p in args.freeze.split(",") if p.strip()]:
+            n = 0
+            for name, prm in model.named_parameters():
+                if name.startswith(pre):
+                    prm.requires_grad_(False)
+                    n += 1
+            if n == 0:
+                sys.exit(f"[05] --freeze prefix {pre!r} matched no parameters. Top-level modules: "
+                         + ", ".join(sorted({nm.split('.')[0] for nm, _ in model.named_parameters()})))
+            print(f"[05] froze {n} tensors under {pre!r}")
+        nt = sum(p.requires_grad for p in model.parameters())
+        print(f"[05] trainable tensors after freeze: {nt}/{len(list(model.parameters()))}")
 
     if args.compile:
         try:
@@ -507,7 +607,35 @@ def main():
     nparam = model.num_parameters() if hasattr(model, "num_parameters") \
         else sum(p.numel() for p in model.parameters())
     print(f"[05] device={device} in_features_dim={cfg.in_features_dim} params={nparam:,}")
-    print(f"[05] model=MEEPO (CNN-Mamba) state_dim={getattr(cfg,'mamba_state_dim',1)} "
+    _bb = str(getattr(cfg, 'backbone', 'meepo')).lower()
+    if _bb == "vm3":
+        _impl = model.backbone.mixer_impl() if hasattr(model, "backbone") and hasattr(model.backbone, "mixer_impl") else "?"
+        print(f"[05] model=VM3 (VoxelMamba-3: group-free whole-scene Mamba-3) "
+              f"mixer={_impl} d_state={getattr(cfg,'vm3_state',64)} headdim={getattr(cfg,'vm3_headdim',64)} "
+              f"expand={getattr(cfg,'vm3_expand',2)} enc={tuple(getattr(cfg,'vm3_enc_channels',(128,256,384,512)))} "
+              f"depths={tuple(getattr(cfg,'vm3_enc_depths',(2,2,2,2)))} dsb_down={tuple(getattr(cfg,'vm3_dsb_down',(1,2,4,4)))} "
+              f"iwe_w={getattr(cfg,'vm3_iwe_window',16)} cpe={bool(getattr(cfg,'vm3_use_cpe',True))} "
+              f"bands={bool(getattr(cfg,'vm3_decay_bands',True))} ssm_backend={getattr(cfg,'ssm_backend','auto')} "
+              f"raster={bool(getattr(cfg,'use_dtm_raster',True))} "
+              f"[official multi-head Mamba-3 SISO; varlen cu_seqlens; DSB fwd/bwd; IWE; no in-mixer conv]")
+        if _impl != "mamba3-official" and str(getattr(cfg, 'ssm_backend', 'auto')).lower() != "torch":
+            print("[05] WARNING: VM3 is running the pure-torch Mamba-3 reference (slow). "
+                  "Install the official package: pip install -e ~/mamba-main --no-deps "
+                  "(needs triton, einops, transformers, packaging) and pass --ssm-backend cuda.")
+    elif _bb == "meepo3":
+        print(f"[05] model=MEEPO-3 (MEEPO CNN-Mamba host + Mamba-3 mixer) "
+              f"d_state={getattr(cfg,'meepo3_state',4)} conv={getattr(cfg,'mamba_conv_dim',4)} "
+              f"expand={getattr(cfg,'mamba_expand_factor',3)} dirs={getattr(cfg,'mamba_directions',2)} "
+              f"ssm_backend={getattr(cfg,'ssm_backend','auto')} raster={bool(getattr(cfg,'use_dtm_raster',True))} "
+              f"[trapezoidal+RoPE(N>=2)+BCNorm/bias; causal-free conv KEPT per MEEPO Tab.7c]")
+    elif _bb == "pointssm":
+        print(f"[05] model=POINT-SSM-MAMBA (PointSSM host + Mamba-3 mixer) "
+              f"d_state={getattr(cfg,'pointssm_state',32)} expand={getattr(cfg,'pointssm_expand',1)} "
+              f"dsamba_state={getattr(cfg,'pointssm_dsamba_state',4)} norm={getattr(cfg,'norm','ln')} "
+              f"ssm_backend={getattr(cfg,'ssm_backend','auto')} "
+              f"raster={bool(getattr(cfg,'use_dtm_raster',True))}")
+    else:
+        print(f"[05] model=MEEPO (CNN-Mamba) state_dim={getattr(cfg,'mamba_state_dim',1)} "
           f"conv={getattr(cfg,'mamba_conv_dim',4)} expand={getattr(cfg,'mamba_expand_factor',3)} "
           f"dirs={getattr(cfg,'mamba_directions',2)} ssm_backend={getattr(cfg,'ssm_backend','auto')} "
           f"raster={cfg.use_dtm_raster} gating={getattr(cfg,'prior_raster_gating',True)} "

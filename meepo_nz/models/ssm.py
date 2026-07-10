@@ -319,12 +319,33 @@ def selective_scan(u, delta, A, B, C, D=None, z=None,
                 _SSM_BACKEND_REPORTED = True
                 print("[ssm] selective_scan: using the FUSED mamba_ssm CUDA kernel.", flush=True)
             return out
+        except torch.cuda.OutOfMemoryError:
+            raise   # NEVER fall back on OOM: the SSD path allocates far MORE memory
+                    # (intra-chunk tensors scale with d_state) -- falling back turns a
+                    # transient OOM into a guaranteed one. Lower the batch instead.
         except Exception as _e:
             if backend == "cuda":
                 raise   # caller explicitly demanded the kernel; surface the failure
             # auto fallback: SSD on GPU (launch-overhead-bound -> SSD's ~chunk-fold fewer
             # sequential steps win); naive loop on CPU (FLOP-bound -> the loop is fine).
             picked = "ssd" if u.is_cuda else "ref"
+            # Report EVERY DISTINCT failure reason once (not just the first ever): a
+            # later call with a different shape/dtype profile silently routing to SSD
+            # after the 'FUSED' banner is how the 2026-07-09 96GB OOM happened.
+            global _SSM_FALLBACK_SEEN
+            try:
+                _SSM_FALLBACK_SEEN
+            except NameError:
+                _SSM_FALLBACK_SEEN = set()
+            _key = (type(_e).__name__, str(_e)[:160])
+            if _key not in _SSM_FALLBACK_SEEN:
+                _SSM_FALLBACK_SEEN.add(_key)
+                print(f"[ssm] WARNING fused kernel REJECTED this call profile "
+                      f"(u{tuple(u.shape)} {u.dtype}, B{tuple(B.shape)} {B.dtype}, "
+                      f"N={A.shape[1]}): {type(_e).__name__}: {str(_e)[:160]} "
+                      f"-> falling back to '{picked}'. At large d_state the SSD "
+                      f"fallback is MUCH heavier -- use --ssm-backend cuda to fail "
+                      f"loudly instead.", flush=True)
             if not _SSM_BACKEND_REPORTED:
                 _SSM_BACKEND_REPORTED = True
                 if picked == "ssd":

@@ -34,7 +34,7 @@ GrounDiff **Eq. 5** + its ablations. "Config" = this repo's default.
 | Params | 100M total / 60M activated (Tab. 12/13) | smoke = 99,892,172 | ✓ |
 | Loss | CrossEntropy + Lovász, weight 1.0 each | `loss_lovasz=True`, CE+Lovász | ✓ |
 | Total batch size | **16** (indoor+outdoor, "total bs in all gpus") | `batch_num=16` | ✓ |
-| Per-scene point budget | SphereCrop `point_max=204800` | `scene_max_points=204800` | ✓ |
+| Per-scene point budget | SphereCrop `point_max=102400` (ICLR paper Tab.11) | `scene_max_points=102400` | ✓ |
 | LR warmup | OneCycle `pct_start=0.05` (~6 of 120 ep) | `warmup_epochs=6` | ≈ |
 | Iters / epoch | 1500 (indoor+outdoor: 180k iters / 120 ep) | `--epoch-steps 1500` | ✓ |
 | Epochs | 120 | `--epochs 120` | ✓ |
@@ -89,7 +89,7 @@ PTv3 / MEEPO does **NOT** train on KPConv input spheres. Re-reading the official
 
 | Stage | MEEPO / Pointcept | This repo (`scene_mode=True`, the default) |
 |---|---|---|
-| Train | augment (rotate-z + small tilt, scale, flip, jitter, elastic) → **GridSample** (one point/voxel) → **SphereCrop**(`point_max≈204800`) → Collect — *one whole scene, voxelized, cropped to a point budget* | augment (`augment_tile`) → `SceneDataset` whole tile / large block, count-capped to `scene_max_points` → `PTv3Collate` GridSample at `first_subsampling_dl` | ✓ |
+| Train | augment (rotate-z + small tilt, scale, flip, jitter, elastic) → **GridSample** (one point/voxel) → **SphereCrop**(`point_max≈102400`, ICLR Tab.11) → Collect — *one whole scene, voxelized, cropped to a point budget* | augment (`augment_tile`) → `SceneDataset` whole tile / large block, count-capped to `scene_max_points` → `PTv3Collate` GridSample at `first_subsampling_dl` | ✓ |
 | Val | GridSample whole scene, **no crop, no voting** | `SceneDataset` (eval window) → GridSample | ✓ |
 | Test | GridSample(`mode=test`) fragments + TTA, votes summed; huge scenes tiled | `predict_scene` block-tiled whole-scene, GridSample per block | ≈ (block-tiled, no TTA) |
 

@@ -7,7 +7,14 @@ from .hilbert import decode as hilbert_decode_
 
 @torch.inference_mode()
 def encode(grid_coord, batch=None, depth=16, order="z"):
-    assert order in {"z", "z-trans", "hilbert", "hilbert-trans"}
+    assert order in {"z", "z-trans", "hilbert", "hilbert-trans", "hilbert-yzx", "hilbert-zxy"}
+    # Displaced-order Hilbert (PointSSM Sec 3.2 / Fig.7): axis permutations xyz/yzx/zxy.
+    # Implemented as a column permutation of grid_coord before the standard xyz encoder --
+    # identical curve geometry, permuted traversal axes.
+    if order == "hilbert-yzx":
+        grid_coord = grid_coord[:, [1, 2, 0]]; order = "hilbert"
+    elif order == "hilbert-zxy":
+        grid_coord = grid_coord[:, [2, 0, 1]]; order = "hilbert"
     if order == "z":
         code = z_order_encode(grid_coord, depth=depth)
     elif order == "z-trans":

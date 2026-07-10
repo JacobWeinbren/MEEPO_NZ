@@ -29,6 +29,7 @@ from torch.utils.data import Dataset
 
 from .augment import augment_tile
 from .dtm import MultiRaster, crop_multiraster_patch, PRIOR_RASTER_CHANNELS
+from .splitting import effective_split
 from .tile_io import load_tile
 from ..features.shallow_features import assemble_features
 from ..utils.laz_io import IGNORE_LABEL
@@ -83,6 +84,7 @@ class SceneDataset(Dataset):
             try:
                 with np.load(f, allow_pickle=True) as d:
                     fsplit = str(d["split"]) if "split" in d else "train"
+                    fsplit = effective_split(f, fsplit, cfg)   # --resplit-seed override
                     if split is not None and fsplit != split:
                         continue
             except Exception:

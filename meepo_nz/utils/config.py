@@ -24,12 +24,26 @@ class Config:
     kernel_sizes: List[int] = field(default_factory=lambda: [7, 13, 15])  # legacy sphere-mode branch kernel sizes (unused by the PTv3/LitePT backbones; kept for the sphere data path)
     first_subsampling_dl: float = 0.10       # finest grid size (m); 10 cm. PTv3-native full-scene default. CHANGING THIS -> re-run stage 04 (preprocess subsamples the raw cloud at this grid).
     # --- PTv3 full-scene mode (replaces KPConv sphere cropping) ------------------
-    scene_mode: bool = True                   # DEFAULT = PTv3-native whole-scene (GridSample+point-budget crop, the MEEPO/Pointcept method). --sphere-mode for the legacy KPConv path (KPConv-style in_radius cylinders + variable batch). FAST (a batch is ~batch_num small spheres) and the prior-DTM raster branch (use_dtm_raster) is active. The previous-year DTM also rides along as the per-point use_prev_dtm channel. Pass --scene-mode for the PTv3-native whole-scene path (receptive field = scene_block_size, but at full 10 cm resolution one block is huge -> needs grad_checkpointing and is much slower per epoch). Receptive field in sphere mode = in_radius (below).
-    scene_max_points: int = 204_800           # = MEEPO SphereCrop point_max (Tab/transform: dict(type="SphereCrop", point_max=204800)). Hard cap on points per scene/block per forward. WITH grad_checkpointing ON (default) batch_num=16 of these (~3.3M pts total) fits in ~66 GB of the 96 GB card. At dl=0.1 a 200-300 m block holds >=204800 pts so this caps it (paper-faithful); raise only if you want bigger scenes and have VRAM. Lower if OOM. With --compile set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (the inductor scatter fallback fragments the allocator).
+    scene_mode: bool = True                   # ALWAYS True. The legacy KPConv sphere mode was REMOVED (2026-07-09, user directive): PTv3-native whole-scene is the only path. Field retained frozen so configs/tiles that carry it stay loadable.
+    backbone: str = "meepo"                    # 'meepo' | 'meepo3' | 'pointssm'. meepo3 = MEEPO host (unchanged) + Mamba-3 recurrence in the mixer (models/meepo3.py); NOT --init-from compatible with meepo checkpoints (new heads, wider x_proj).
+    meepo3_state: int = 16                     # MEEPO-3 d_state. 16 = the official kernel's HARD FLOOR (tl.dot contraction K>=16; plus TMA headdim>=8 and even angle count -- three constraints, each caught by the parity gate on sm_120 before costing a training run) and a PointSSM-ablated value (16 -> 76.9). Below 16 the mixer runs fallback-only. --meepo3-state.                    # 'meepo' (MEEPO CNN-Mamba, default -- checkpoint lineage) or 'pointssm' (PointSSM host [Li et al., IJAEG 2025 Tab.1] + Mamba-3 mixer [Lahoti et al., 2026] -- the 'point-ssm-mamba' backbone; see models/pointssm3.py). NOTE: the two are NOT --init-from compatible (disjoint parameter shapes).
+    pointssm_enc_depths: tuple = (1, 1, 2, 4, 1)      # PointSSM Table 1
+    pointssm_enc_channels: tuple = (64, 64, 128, 256, 512)
+    pointssm_dec_depths: tuple = (1, 1, 1, 1)
+    pointssm_dec_channels: tuple = (64, 64, 128, 256)
+    pointssm_state: int = 32                   # d_state (MambaConv), PointSSM Tab.1/Tab.11; even (Mamba-3 pairs)
+    pointssm_expand: int = 1                   # expand (MambaConv), PointSSM Tab.1
+    pointssm_dsamba_state: int = 4             # d_state (DSamba), PointSSM Tab.1/Tab.10
+    pointssm_dsamba_expand: int = 2            # expand (DSamba), PointSSM Tab.1
+    pointssm_drop_path: float = 0.1            # PointSSM Tab.1
+    scene_max_points: int = 102_400            # = MEEPO SphereCrop point_max (ICLR paper Tab.11: "sphere crop | max points: 102400"). Hard cap on points per scene/block per forward AND per inference disc (predict_scene), keeping train and deploy budgets identical. NOTE: an earlier revision said 204,800, sourced during the repo's MEEPO-identity confusion; the ICLR paper is binding.
     scene_block_size: float = 300.0           # m; side length of the contiguous block fed per forward (also the PTv3-native inference tiling grid). THIS is the spatial receptive field. At dl=0.10 (kept everywhere) a full 300 m block at ~13 pts/m^2 is ~1.17M pts, so it is count-cropped to scene_max_points (~190 m effective per block); blocks tile the scene with a margin ring so coverage is complete. Raise for more reach if VRAM allows.
     scene_block_margin: float = 8.0           # m; ABSOLUTE floor for the context ring around each inference block.
     scene_block_margin_frac: float = 0.10     # context ring is at least this fraction of the block size (>=10%); effective margin = max(scene_block_margin, frac*scene_block_size).
     scene_vote_step_m: float = 50.0           # SparseGF soft-voting: grid step (m) between disc centres at val/test/inference. Each disc classifies its circular CENTRAL region of radius (sqrt2/2)*step (circumscribes the cell -> full coverage + edge/corner overlap), with the nearest scene_max_points as context. Overlapping central regions are soft-voted (averaged softmax). SparseGF uses 50 m. Smaller = more overlap/votes but slower; must stay below the context disc radius.
+    tile_stats_radius: float = 6.0            # m; radius of the per-tile candidate-statistics cylinders baked at stage 04 (scene-type classification + gallery selection ONLY -- no model input flows through these). 6.0 = the historical value, so existing tiles remain format- and statistics-identical; retained after sphere-mode removal.
+    tile_stats_spacing: float = 5.0           # m; grid spacing of the stage-04 candidate-statistics centres (historical value; tile format unchanged).
+    tile_stats_min_points: int = 100          # min subsampled points for a stats cylinder to be kept (historical value).
     scene_min_points: int = 100               # blocks/tiles with fewer points fall back to the nearest-N points.
     scene_val_tiles: int = 32                  # per-epoch validation scores ONE scene_block_size window per sampled tile (KPConv's bounded validation_size regions, region size = our training region), via the deployed full-res inference (predict_scene), on a fixed evenly-spaced subset of this many tiles -> a stable, fast, paper-faithful number. KPConv never validates on whole scenes; full-tile coverage is reserved for the FINAL test (evaluate_split, max_tiles=None). Lower if eval is slow; 0/None = all tiles (whole-tile, slow).
     tta: bool = False                          # test-time augmentation: average softmax over z-rotations 0/90/180/270 (Pointcept SemSegTester aug_transform). Applied at the FINAL test (evaluate_split) and inference (--tta), NOT per-epoch val (kept fast). Rotates BOTH the cloud and the georeferenced prior raster together (rot90 + georef), matching how augment_tile rotates the prior patch at train time.
@@ -113,12 +127,7 @@ class Config:
     data_root: str = "data"
     tile_size: float = 50.0                  # m; used only for the DTM-raster patch extent fallback / legacy
     # ---- KPConv input-sphere sampling (replaces tiling; faithful to KPConv KP-FCNN) ----
-    auto_in_radius: bool = False             # KPConvX sizes the input region by a fixed in_radius/sub_size ratio (~50: S3DIS 2.1 m @ 4 cm), NOT by conv reach. So leave OFF for the KPConvX network and set in_radius below. (When True, resolve_geometry() instead sets in_radius = conv_radius*dl0*2^(num_layers-1) - the old depth-driven sizing, suited to the original MultiKPFCNN.)
-    in_radius: float = 6.0                    # m; radius of each input CYLINDER (sphere mode). PTv3 mixes information across the WHOLE cylinder via serialised attention + grid-pool levels, so the radius only needs enough points for context, not a wide ball - 6 m (12 m across) keeps spheres small/fast (~1.5-2k pts/sphere at dl=0.1) and yields more samples per epoch. The raster patch auto-covers 2*in_radius. CHANGING THIS -> re-run stage 04 (candidate cylinders cand_idx are baked at in_radius); --in-radius N. Ignored when scene_mode=True.
-    sphere_center_spacing: float = 5.0        # m; [LEGACY sphere mode only] grid spacing of candidate cylinder centres.
     tile_cache_size: int = 4                 # max preprocessed tiles kept in each loader's LRU cache (each ~ one tile's arrays). Bounds RAM; raise if you have headroom and want fewer reloads.
-    sphere_min_points: int = 100             # cylinders with fewer subsampled points fall back to the nearest-N points
-    infer_batch_spheres: int = 16            # inference: spheres per forward pass (batched as a PTv3 multi-cloud batch). Higher = faster on a big GPU; lower if VRAM-bound. --infer-batch
     tile_overlap: float = 5.0                # m; legacy (unused by the sphere pipeline)
     max_points_per_tile: int = 400000        # raw safety bound only; preprocessing grid-subsamples each tile to first_subsampling_dl (full voxel coverage, no random decimation), so this rarely binds and does not set the resolution
     max_train_tiles: int = 0                  # 0 = use ALL train tiles. >0 = train on only this many train tiles (deterministic, seeded), to shrink the working set so it fits host RAM/page-cache. Each kept tile is full-fidelity (no compression); only val/test always use all tiles. Lossless per-sample alternative to dtype/compression.
@@ -181,8 +190,8 @@ class Config:
     augment_noise_clip: float = 0.02         # m, jitter clip -- MEEPO/PTv3 RandomJitter clip=0.02
     augment_dropout_ratio: float = 0.2       # MEEPO RandomDropout dropout_ratio=0.2 (drop this fraction of points)
     augment_dropout_prob: float = 0.2        # MEEPO RandomDropout dropout_application_ratio=0.2 (per-sample prob it fires). Density-robustness; does NOT move (x,y) so the per-point prior raster stays consistent.
-    augment_tilt_xy: float = 0.0             # rad; MEEPO RandomRotate x/y = +-pi/64 (~0.049). DEFAULT 0 (off): a tilt mixes z into (x,y) by a z-dependent amount the 2D georeferenced prior (Deviation A) cannot follow, desyncing the prior by ~relief*sin(angle). Set to 0.04908 to match MEEPO exactly.
-    augment_elastic: bool = False            # MEEPO ElasticDistortion. DEFAULT off: warps the ground SURFACE by up to ~1.6 m AND moves (x,y), desyncing the prior. Enable (--augment-elastic) to match MEEPO exactly.
+    augment_tilt_xy: float = 0.04908         # rad = pi/64; MEEPO official config (semseg-meepo.py): RandomRotate x/y angle=[-1/64,1/64] (units of pi), p=0.5 each axis. DEFAULT ON for paper faithfulness. KNOWN COST: a tilt mixes z into (x,y) by ~relief*sin(angle), which the 2D georeferenced prior patch (Deviation A, absent in MEEPO) cannot follow; per-point prior channels are baked pre-augmentation and ride along. 0 disables.
+    augment_elastic: bool = True             # MEEPO official config (semseg-meepo.py): ElasticDistortion distortion_params=[[0.2,0.4],[0.8,1.6]]. DEFAULT ON for paper faithfulness. KNOWN COST: warps the surface (<=~1.6 m) + (x,y) against the static prior patch (Deviation A; MEEPO has no prior branch).
     augment_elastic_params: tuple = ((0.2, 0.4), (0.8, 1.6))  # MEEPO distortion_params=[[0.2,0.4],[0.8,1.6]] (granularity_m, magnitude_m) pairs
 
     # ---------------- training ----------------
@@ -251,6 +260,7 @@ class Config:
     grad_checkpointing: bool = True           # recompute PTv3 encoder/decoder block activations in backward instead of storing them (~10x less activation memory, ~20-30% slower). THE way to train large full-resolution scene blocks (keep dl=0.1) within 96 GB. --no-grad-checkpoint to disable if you have VRAM headroom and want speed.
     checkpoint_granularity: str = "block"     # recompute granularity when grad_checkpointing is on: 'stage' (whole stage as one segment: least recompute, most VRAM), 'block' (per block; default = current behaviour), 'layer' (each block's xCPE/Mamba/MLP separately: most recompute, least VRAM -> for small-VRAM cards). Overridden to 'none' when grad_checkpointing is off.
     mask_uncovered_prev_dtm: bool = True      # when a previous-year prior does not cover a point (NoData hole or outside the raster extent), zero that point's z-prevDTM feature instead of extrapolating the raster's edge value. Keeps a partial / hand-crafted prior raster from injecting phantom deviation signal; the raster branch still sees the coverage channel. Set False for the legacy extrapolate-to-edge behaviour.
+    prior_crop_margin: float = 25.0           # m; prior-raster crop margin beyond each tile's extent (edge blocks keep coverage). Independent of in_radius (sphere-mode-only knob); matches the stage-02 mosaic margin.
     ground_classes: tuple = (2, 9)            # ASPRS codes counted as GROUND (2=ground, 9=water).
     unclassified_classes: tuple = (0, 1)      # ASPRS codes mapped to IGNORE (excluded from loss+metrics). DATASET-DEPENDENT: if your data marks ALL non-ground as class 1 (common in British EA products that classify only ground), the default IGNORES every non-ground point and the model degenerates to all-ground -- set (0,) (stage 04: --unclassified-classes 0) so class 1 counts as non-ground. Baked into tiles at stage 04: changing this requires re-preprocessing.
     # --- GrounDiff nDSM regression (Dhaouadi et al. 2025, Eqs. 11-12) ----------
@@ -338,7 +348,8 @@ class Config:
     # ------------------------------------------------------------------ #
     # Backbone selector + LitePT variant (A/B against MEEPO-L)
     # ------------------------------------------------------------------ #
-    backbone: str = "meepo"              # "meepo" (CNN-Mamba, default) -- PTv3/LitePT + MoE were stripped.
+    backbone: str = "meepo"                    # 'meepo' | 'meepo3' | 'pointssm'. meepo3 = MEEPO host (unchanged) + Mamba-3 recurrence in the mixer (models/meepo3.py); NOT --init-from compatible with meepo checkpoints (new heads, wider x_proj).
+    meepo3_state: int = 16                     # MEEPO-3 d_state. 16 = the official kernel's HARD FLOOR (tl.dot contraction K>=16; plus TMA headdim>=8 and even angle count -- three constraints, each caught by the parity gate on sm_120 before costing a training run) and a PointSSM-ablated value (16 -> 76.9). Below 16 the mixer runs fallback-only. --meepo3-state.              # "meepo" (CNN-Mamba, default) -- PTv3/LitePT + MoE were stripped.
     # MEEPO (CNN-Mamba) backbone -- hyperparameters from the MEEPO ScanNet config
     # (semseg-meepo.py). Each block is SubMConv3d(cpe) -> RMSNorm -> Bidirectional
     # Mamba -> LayerNorm -> MLP; no MoE; LayerNorm/RMSNorm only (micro-batch-1 safe).
@@ -370,28 +381,8 @@ class Config:
     dtm_cnn_mid: int = 32                # 2D-CNN width
 
     def resolve_geometry(self, num_layers: int = None) -> "Config":
-        """When ``auto_in_radius`` is set, size the input cylinder to the coarsest
-        conv reach (``conv_radius * first_subsampling_dl * 2**(num_layers-1)``) and
-        keep ``sphere_center_spacing`` equal to it. ``num_layers`` defaults to
-        ``self.num_layers`` (matches the architecture). Idempotent; call after
-        load()/CLI overrides and BEFORE preprocessing (stage 04) or training.
-        Returns self."""
-        if num_layers is None:
-            num_layers = int(getattr(self, "num_layers", 5))
-        # For the KPConvX network, the number of resolution levels is fixed by the
-        # blocks-per-level list; keep num_layers (which the batch pyramid uses) in sync.
-        if bool(getattr(self, "use_kpconvx", False)):
-            lb = list(getattr(self, "layer_blocks", []))
-            if lb:
-                num_layers = len(lb)
-                self.num_layers = num_layers
-        if getattr(self, "auto_in_radius", False):
-            gs = float(getattr(self, "grid_scaling", 2.0))
-            r = float(self.conv_radius) * float(self.first_subsampling_dl) * (gs ** (num_layers - 1))
-            self.in_radius = float(r)
-            self.sphere_center_spacing = float(r)
+        """No-op since sphere-mode removal (auto_in_radius/in_radius deleted). Retained for API compat."""
         return self
-
     def save(self, path: str) -> None:
         if yaml is None:
             raise RuntimeError("pyyaml not installed")

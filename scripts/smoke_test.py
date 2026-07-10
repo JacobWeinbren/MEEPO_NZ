@@ -32,6 +32,8 @@ os.environ["POINT_MOE_DISABLE_SPCONV"] = "1"
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from meepo_nz.utils.config import Config
 from meepo_nz.utils.laz_io import GROUND_CLASSES, IGNORE_LABEL
@@ -42,15 +44,15 @@ from meepo_nz.data.dtm import (build_prior_raster_from_prev, crop_multiraster_pa
                                     crop_downsample_multiraster)
 from meepo_nz.models import build_meepo
 from meepo_nz.training.losses import SegLoss
-from meepo_nz.inference.voting import predict_cloud_spheres
+from meepo_nz.inference.voting import predict_scene
 
 
 def _tiny_cfg():
     cfg = Config()
     cfg.first_subsampling_dl = 0.5
-    cfg.in_radius = 8.0
-    cfg.sphere_center_spacing = 8.0
-    cfg.sphere_min_points = 50
+    cfg.tile_stats_radius = 8.0
+    cfg.tile_stats_spacing = 8.0
+    cfg.tile_stats_min_points = 50
     cfg.enc_stride = (2, 2)
     cfg.meepo_enc_depths = (1, 1, 1); cfg.meepo_enc_channels = (8, 16, 16)
     cfg.meepo_dec_depths = (1, 1); cfg.meepo_dec_channels = (16, 16)
@@ -102,7 +104,7 @@ def main():
     fdim = expected_feature_dim(cfg)
 
     def mk(n):
-        pts = (np.random.rand(n, 3).astype(np.float32) - 0.5) * 2 * cfg.in_radius
+        pts = (np.random.rand(n, 3).astype(np.float32) - 0.5) * 2 * 8.0
         pts[:, 2] *= 0.1
         pa = np.random.randn(5, cfg.dtm_patch_size, cfg.dtm_patch_size).astype(np.float32)
         pa[4] = (pa[4] > 0).astype(np.float32)
@@ -142,18 +144,21 @@ def main():
     nret = np.random.randint(1, 4, n).astype(np.float32)
     rnum = np.ones(n, np.float32)
     inten = np.random.rand(n).astype(np.float32)
-    pred, proba = predict_cloud_spheres(cur, nret, rnum, cfg, model, torch.device("cpu"),
-                                        prev_dtm=mr, intensity=inten, return_proba=True)
+    import copy as _cp0
+    cfg5 = _cp0.copy(cfg); cfg5.scene_mode = True
+    pred, proba = predict_scene(cur, nret, rnum, cfg5, model, torch.device("cpu"),
+                                prev_dtm=mr, intensity=inten, return_proba=True)
     assert pred.shape == (n,) and proba.shape == (n, 2)
-    print(f"[5/5] voting: pred{pred.shape} classes={np.unique(pred).tolist()} proba{proba.shape}  PASS")
+    print(f"[5/5] scene voting (single disc): pred{pred.shape} classes={np.unique(pred).tolist()} proba{proba.shape}  PASS")
     ok.append(True)
+
 
     # ---- 5b. TTA (scene-mode): rotation-averaged softmax; cloud + georeferenced
     #          prior raster rotated together (verified sample-preserving rot90+georef)
     import copy as _copy
     cfg_tta = _copy.copy(cfg); cfg_tta.scene_mode = True
-    pred_t, proba_t = predict_cloud_spheres(cur, nret, rnum, cfg_tta, model, torch.device("cpu"),
-                                            prev_dtm=mr, intensity=inten, return_proba=True, tta=True)
+    pred_t, proba_t = predict_scene(cur, nret, rnum, cfg_tta, model, torch.device("cpu"),
+                                    prev_dtm=mr, intensity=inten, return_proba=True, tta=True)
     assert pred_t.shape == (n,) and proba_t.shape == (n, 2)
     assert np.allclose(proba_t.sum(1), 1.0, atol=1e-3), "TTA proba rows must sum to 1"
     print(f"[5b] TTA voting (z-rot 0/90/180/270, prior rotated with cloud): "
@@ -167,7 +172,7 @@ def main():
     cfg_vote.scene_mode = True
     cfg_vote.scene_max_points = 1200            # << n_sub -> forces multi-disc tiling
     cfg_vote.scene_vote_step_m = 15.0           # Rc=(sqrt2/2)*15~=10.6 m over the 30 m cloud
-    pred_v, proba_v = predict_cloud_spheres(cur, nret, rnum, cfg_vote, model, torch.device("cpu"),
+    pred_v, proba_v = predict_scene(cur, nret, rnum, cfg_vote, model, torch.device("cpu"),
                                             prev_dtm=mr, intensity=inten, return_proba=True)
     assert pred_v.shape == (n,) and proba_v.shape == (n, 2)
     assert np.isfinite(proba_v).all(), "coverage gap: voting left NaN/uncovered points"
@@ -188,7 +193,7 @@ def main():
     assert _gc and all(_gc), "grad_checkpointing must propagate to ALL MEEPO blocks"
     fdim = expected_feature_dim(lcfg)
     def _mk(nn_):
-        p = (np.random.rand(nn_, 3).astype(np.float32) - 0.5) * 2 * lcfg.in_radius; p[:, 2] *= 0.1
+        p = (np.random.rand(nn_, 3).astype(np.float32) - 0.5) * 2 * 8.0; p[:, 2] *= 0.1
         pa = np.random.randn(5, lcfg.dtm_patch_size, lcfg.dtm_patch_size).astype(np.float32)
         pa[4] = (pa[4] > 0).astype(np.float32)
         return dict(points=p, features=np.random.randn(nn_, fdim).astype(np.float32),
@@ -284,7 +289,7 @@ def main():
     lcfg = _tiny_cfg(); lcfg.spag_learned = True; lcfg.use_dtm_raster = False
     lm = build_meepo(lcfg); lm.train()
     def _mkr(n):
-        return {"points": (np.random.rand(n, 3).astype(np.float32) - 0.5) * 2 * lcfg.in_radius,
+        return {"points": (np.random.rand(n, 3).astype(np.float32) - 0.5) * 2 * 8.0,
                 "features": np.random.randn(n, expected_feature_dim(lcfg)).astype(np.float32),
                 "labels": (np.random.rand(n) > 0.5).astype(np.int64),
                 "regime": oracle_regime_globals(np.random.rand(200, 3) * 20).astype(np.float32),
@@ -371,7 +376,7 @@ def main():
     mcfg = _tiny_cfg(); mcfg.spag_learned = True; mcfg.use_dtm_raster = False
     mm = build_meepo(mcfg); mm.train()
     def _mkm(n):
-        return {"points": (np.random.rand(n, 3).astype(np.float32) - 0.5) * 2 * mcfg.in_radius,
+        return {"points": (np.random.rand(n, 3).astype(np.float32) - 0.5) * 2 * 8.0,
                 "features": np.random.randn(n, expected_feature_dim(mcfg)).astype(np.float32),
                 "labels": (np.random.rand(n) > 0.5).astype(np.int64),
                 "regime": oracle_regime_globals(np.random.rand(200, 3) * 20).astype(np.float32),
@@ -415,7 +420,7 @@ def main():
                 c[_n] += 1
         return c
     for _bb in ("meepo",):
-        _c = Config(); _c.backbone = _bb; _c.first_subsampling_dl = 0.5; _c.in_radius = 8.0
+        _c = Config(); _c.backbone = _bb; _c.first_subsampling_dl = 0.5
         _c.norm = "ln"; _c.dtm_patch_size = 24; _c.dtm_feat_dim = 6; _c.dtm_cnn_mid = 12
         _c.stem_kernel_size = 3; _c.ssm_backend = "torch"
         _c.enc_stride = (2, 2)
@@ -423,7 +428,7 @@ def main():
         _c.meepo_dec_depths = (1, 1); _c.meepo_dec_channels = (16, 16)
         _fd = expected_feature_dim(_c)
         def _mk(n, _c=_c, _fd=_fd):
-            _p = (np.random.rand(n, 3).astype(np.float32) - 0.5) * 2 * _c.in_radius; _p[:, 2] *= 0.1
+            _p = (np.random.rand(n, 3).astype(np.float32) - 0.5) * 2 * 8.0; _p[:, 2] *= 0.1
             _pa = np.random.randn(5, _c.dtm_patch_size, _c.dtm_patch_size).astype(np.float32)
             return dict(points=_p, features=np.random.randn(n, _fd).astype(np.float32),
                         labels=(np.random.rand(n) > 0.5).astype(np.int64), dtm_patch=_pa,
@@ -463,6 +468,191 @@ def main():
     assert torch.allclose(_y2, _y3), "dispatcher backend='ssd' must route to selective_scan_ssd"
     print(f"[12] SSD chunked scan (Mamba-2 alg): parity with reference loop fwd|dy|={_ey:.1e} "
           f"grad|dg|={_eg:.1e} (fp32, odd-L padding path); dispatcher 'ssd' routes correctly  PASS")
+    ok.append(True)
+
+    # ---- [13] transfer init: weights-only load, wrapper-prefix strip, shape guard ----
+    from meepo_nz.training.trainer import load_pretrained
+    import copy as _copy
+    import tempfile as _tf
+    _ck = os.path.join(_tf.mkdtemp(), "ck.pt")
+    torch.save({"model_state": {"_orig_mod." + k: v for k, v in _m.state_dict().items()}}, _ck)
+    _dst = build_meepo(_c)
+    load_pretrained(_dst, _ck, verbose=False)
+    assert all(torch.equal(a, b) for a, b in zip(_m.state_dict().values(), _dst.state_dict().values())), \
+        "transfer-loaded weights must match the checkpoint exactly"
+    _c3 = _copy.deepcopy(_c); _c3.num_classes = 3
+    try:
+        load_pretrained(build_meepo(_c3), _ck, verbose=False)
+        raise AssertionError("shape guard must reject num_classes mismatch")
+    except SystemExit:
+        pass
+    print("[13] transfer init (--init-from): exact weights-only load (+_orig_mod strip); "
+          "shape-mismatch hard-rejected  PASS")
+    ok.append(True)
+
+    # ---- 14. point-ssm-mamba: Mamba-3 trapezoidal two-scan EXACTNESS ---------
+    # The two-selective-scan decomposition must reproduce the brute-force
+    # exponential-trapezoidal recurrence (Mamba-3 Prop. 1) to numerical precision.
+    from meepo_nz.models.pointssm3 import Mamba3, PointSSM3
+    torch.manual_seed(7)
+    _B, _d, _L, _N = 2, 3, 9, 4
+    xt = torch.randn(_B, _d, _L); dt = F.softplus(torch.randn(_B, _d, _L))
+    Bb = torch.randn(_B, _N, _L); Cb = torch.randn(_B, _N, _L)
+    lam = torch.sigmoid(torch.randn(_B, _d, _L)); a = -torch.rand(_d) - 0.1
+    a_t = -(torch.rand(_B, _d, _L) + 0.1)                                    # data-dep A
+    y2s = Mamba3._scan_core(xt, dt, Bb, Cb, lam, None, D=None, backend="torch", a_t=a_t)
+    alpha = torch.exp(dt * a_t)
+    h = torch.zeros(_B, _d, _N); yref = torch.zeros_like(y2s)
+    for t in range(_L):
+        g = (lam[:, :, t] * dt[:, :, t]).unsqueeze(-1)                       # gamma_t
+        v = g * Bb[:, :, t].unsqueeze(1) * xt[:, :, t].unsqueeze(-1)
+        if t > 0:
+            b = ((1 - lam[:, :, t]) * dt[:, :, t] * alpha[:, :, t]).unsqueeze(-1)  # beta_t
+            v = v + b * Bb[:, :, t - 1].unsqueeze(1) * xt[:, :, t - 1].unsqueeze(-1)
+        h = alpha[:, :, t].unsqueeze(-1) * h + v
+        yref[:, :, t] = torch.einsum("bdn,bn->bd", h, Cb[:, :, t])
+    derr = float((y2s - yref).abs().max())
+    assert derr < 1e-4, f"trapezoidal two-scan mismatch: {derr}"
+    m3 = Mamba3(8, d_state=4, expand=1, bidirectional=True, ssm_backend="torch")
+    yb = m3(torch.randn(1, 30, 8)); yb.sum().backward()
+    assert torch.isfinite(yb).all()
+    m3e = Mamba3(8, d_state=4, expand=1, bidirectional=False, ssm_backend="torch")
+    m3e._force_euler = True
+    assert torch.isfinite(m3e(torch.randn(1, 20, 8))).all()   # exp-Euler degeneracy runs
+    print(f"[14] Mamba-3 mixer: trapezoidal two-scan (DATA-DEPENDENT A, audited vs "
+          f"official repo f577286) == loop reference (|dy|={derr:.1e}); "
+          f"bidir fwd+bwd finite; Euler degeneracy OK  PASS")
+    ok.append(True)
+
+    # ---- 15. point-ssm-mamba backbone end-to-end (PointSSM host + Mamba-3) ---
+    cfg_ps = _tiny_cfg()
+    cfg_ps.backbone = "pointssm"
+    cfg_ps.norm = "ln"
+    cfg_ps.pointssm_enc_depths = (1, 1, 1); cfg_ps.pointssm_enc_channels = (8, 16, 16)
+    cfg_ps.pointssm_dec_depths = (1, 1); cfg_ps.pointssm_dec_channels = (16, 16)
+    cfg_ps.pointssm_state = 4; cfg_ps.pointssm_dsamba_state = 2
+    cfg_ps.pointssm_expand = 1; cfg_ps.pointssm_drop_path = 0.0
+    batch_ps = PTv3Collate(cfg_ps)([mk(1200), mk(900)])
+    model_ps = build_meepo(cfg_ps)
+    assert sum(1 for _m in model_ps.modules()
+               if isinstance(_m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))) == 0 or            bool(getattr(cfg_ps, "use_dtm_raster", True)), "backbone must stay BN-free"
+    from meepo_nz.models.pointssm3 import MC3Block, DSamba
+    assert any(isinstance(_m, MC3Block) for _m in model_ps.modules())
+    assert any(isinstance(_m, DSamba) for _m in model_ps.modules())
+    bn_in_bb = sum(1 for _m in model_ps.backbone.modules()
+                   if isinstance(_m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)))
+    assert bn_in_bb == 0, "PointSSM3 backbone must be BN-free (micro-batch-1 safety)"
+    model_ps.train()
+    logits_ps = model_ps(batch_ps)
+    assert logits_ps.shape == (batch_ps["coord"].shape[0], cfg_ps.num_classes)
+    loss_ps = SegLoss()(logits_ps, batch_ps["labels"]); loss_ps.backward()
+    gn = sum(float(p.grad.norm()) ** 2 for p in model_ps.parameters() if p.grad is not None) ** 0.5
+    assert np.isfinite(gn) and gn > 0
+    model_ps.eval()
+    with torch.no_grad():
+        _ = model_ps(batch_ps)
+    print(f"[15] point-ssm-mamba backbone: params={model_ps.num_parameters():,} "
+          f"(PointSSM Tab.1 host, displaced-order Hilbert, DSamba, Mamba-3 mixer) "
+          f"loss={float(loss_ps):.3f} grad_norm={gn:.2f} backbone_BN=0  train+eval  PASS")
+    ok.append(True)
+
+    # ---- 16. point-ssm-mamba paper-exact norm ('bn' -> PointSSM BN&GELU) ------
+    import copy as _cpp
+    cfg_bn = _cpp.copy(cfg_ps); cfg_bn.norm = "bn"
+    model_bn = build_meepo(cfg_bn)
+    n_bn = sum(1 for _m in model_bn.backbone.modules() if isinstance(_m, nn.BatchNorm1d))
+    assert n_bn > 0, "--norm bn must instantiate BatchNorm1d in the PointSSM host"
+    model_bn.train()
+    lg = model_bn(PTv3Collate(cfg_bn)([mk(900), mk(800)]))
+    SegLoss()(lg, torch.randint(0, 2, (lg.shape[0],))).backward()
+    assert all(torch.isfinite(p.grad).all() for p in model_bn.parameters() if p.grad is not None)
+    print(f"[16] point-ssm-mamba --norm bn: {n_bn} BatchNorm1d layers (PointSSM BN&GELU, "
+          f"paper-exact; batch>=2 only) fwd+bwd finite  PASS")
+    ok.append(True)
+
+    # ---- 17. MEEPO-3: MEEPO host + Mamba-3 mixer -----------------------------
+    from meepo_nz.models.meepo3 import BiMamba3
+    torch.manual_seed(11)
+    bm3 = BiMamba3(8, d_state=4, d_conv=4, expand=3, n_directions=4, ssm_backend="torch")
+    with torch.no_grad():
+        lam0 = torch.sigmoid(bm3.lam_projs[0](torch.randn(64, bm3.half) * 0.1)).mean()
+    assert lam0 > 0.8, f"near-Euler init violated: lambda_0={float(lam0):.3f}"
+    yb3 = bm3(torch.randn(2, 40, 8)); yb3.sum().backward()
+    assert torch.isfinite(yb3).all()
+    bm3_n1 = BiMamba3(8, d_state=1, expand=3, n_directions=2, ssm_backend="torch")
+    assert not bm3_n1.use_rope
+    assert torch.isfinite(bm3_n1(torch.randn(1, 25, 8))).all()   # graded mode (RoPE off)
+    cfg_m3 = _tiny_cfg()
+    cfg_m3.backbone = "meepo3"; cfg_m3.meepo3_state = 4
+    model_m3 = build_meepo(cfg_m3)
+    from meepo_nz.models.meepo import BiMamba as _BM1
+    assert not any(isinstance(_m, _BM1) for _m in model_m3.modules()), "meepo3 must not build BiMamba"
+    assert any(isinstance(_m, BiMamba3) for _m in model_m3.modules())
+    batch_m3 = PTv3Collate(cfg_m3)([mk(1100), mk(900)])
+    model_m3.train()
+    lg3 = model_m3(batch_m3)
+    l3 = SegLoss()(lg3, batch_m3["labels"]); l3.backward()
+    g3 = sum(float(p.grad.norm()) ** 2 for p in model_m3.parameters() if p.grad is not None) ** 0.5
+    assert np.isfinite(g3) and g3 > 0
+    model_m3.eval()
+    with torch.no_grad():
+        _ = model_m3(batch_m3)
+    print(f"[17] MEEPO-3 (MEEPO host + Mamba-3 mixer): 4-dir strided + causal-free conv KEPT; "
+          f"lambda_0={float(lam0):.2f} (near-Euler start); N=1 graded mode OK; "
+          f"e2e loss={float(l3):.3f} grad_norm={g3:.2f}  train+eval  PASS")
+    ok.append(True)
+
+    # ---- 18. fused Mamba-3 path: graceful degradation off-GPU ---------------
+    from meepo_nz.models.mamba3_fused import fused_available, fused_reason
+    av = fused_available()
+    assert isinstance(av, bool)
+    if not av:
+        assert fused_reason() is not None    # a stated reason, never silence
+    print(f"[18] fused Mamba-3 (official Triton, vendored @f577286): "
+          f"{'AVAILABLE' if av else 'unavailable -> two-scan fallback'} "
+          f"({fused_reason() or 'ready'}); GPU parity gate = scripts/check_mamba3_triton.py  PASS")
+    ok.append(True)
+
+    # ---- 19. fallback vs the AUTHORS' reference (semantic ground truth) -------
+    # Runs wherever einops is importable (the box; skipped in the bare sandbox).
+    # Exists because smoke [14] once validated the fallback against a loop that
+    # encoded the SAME misreading (rotation sign) -- self-consistent and wrong.
+    try:
+        import einops  # noqa: F401
+        _have_einops = True
+    except Exception:
+        _have_einops = False
+    if _have_einops:
+        from meepo_nz.ops.triton_mamba3.reference import mamba3_siso_fwd_ref
+        torch.manual_seed(5)
+        _B2, _H2, _P2, _L2, _N2 = 1, 2, 16, 61, 16
+        _C2 = _H2 * _P2
+        m19 = Mamba3(_C2, d_state=_N2, expand=1, bidirectional=False, ssm_backend="torch")
+        m19.eval()
+        x19 = torch.randn(_B2, _L2, _C2)
+        with torch.no_grad():
+            xt19 = m19.in_proj(x19).transpose(1, 2).contiguous()
+            y_fb = m19._fallback_scan(m19.in_proj(x19), xt19)
+            Bp19, Cp19 = torch.split(m19.x_proj(m19.in_proj(x19)), [_N2, _N2], dim=-1)
+            dt19 = F.softplus(m19.dt_proj(m19.in_proj(x19)) + m19.dt_bias)
+            dd19 = m19.a_proj(m19.in_proj(x19)).transpose(1, 2)
+            a19 = -((dd19.clamp_min(0) + torch.reciprocal(1 - dd19.clamp_max(0)))).clamp(min=1e-4)
+            ref19, _ = mamba3_siso_fwd_ref(
+                m19.c_norm(Cp19).unsqueeze(2), m19.b_norm(Bp19).unsqueeze(2),
+                xt19.transpose(1, 2).reshape(_B2, _L2, _H2, _P2),
+                (a19 * dt19.transpose(1, 2)), dt19.transpose(1, 2),
+                m19.lam_proj(m19.in_proj(x19)).transpose(1, 2),
+                m19.c_bias.expand(_H2, _N2), m19.b_bias.expand(_H2, _N2),
+                (m19.theta_proj(m19.in_proj(x19))).to(torch.float32)
+                    .unsqueeze(-2).expand(-1, -1, _H2, -1),
+                m19.D, None, None)
+            y_ref = ref19.reshape(_B2, _L2, _C2).transpose(1, 2).float()
+        rel19 = float((y_fb - y_ref).abs().max() / y_ref.abs().max())
+        assert rel19 < 1e-3, f"fallback vs authors' reference: rel={rel19:.3e}"
+        print(f"[19] fallback vs AUTHORS' reference (vendored fwd_ref): rel={rel19:.1e}  PASS")
+    else:
+        print("[19] fallback vs authors' reference: SKIPPED (einops not installed here; "
+              "ENFORCED on any box with einops -- run smoke there)")
     ok.append(True)
 
     print("\nSMOKE TEST PASSED - clean-PyTorch ground segmentation (MEEPO CNN-Mamba backbone) "

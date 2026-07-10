@@ -220,13 +220,20 @@ class SerializedMamba(PointModule):
     """
 
     def __init__(self, channels, mamba_state_dim, mamba_conv_dim, mamba_expand_factor,
-                 order_index=0, n_directions=2, ssm_backend="auto"):
+                 order_index=0, n_directions=2, ssm_backend="auto", mixer="mamba1"):
         super().__init__()
         self.channels = channels
         self.order_index = order_index
-        self.mamba = BiMamba(channels, d_state=mamba_state_dim, d_conv=mamba_conv_dim,
-                             expand=mamba_expand_factor, n_directions=n_directions,
-                             ssm_backend=ssm_backend)
+        if str(mixer).lower() == "mamba3":
+            # MEEPO-3: the Mamba-3 recurrence inside MEEPO's scaffold (meepo3.py)
+            from .meepo3 import BiMamba3
+            self.mamba = BiMamba3(channels, d_state=mamba_state_dim, d_conv=mamba_conv_dim,
+                                  expand=mamba_expand_factor, n_directions=n_directions,
+                                  ssm_backend=ssm_backend)
+        else:
+            self.mamba = BiMamba(channels, d_state=mamba_state_dim, d_conv=mamba_conv_dim,
+                                 expand=mamba_expand_factor, n_directions=n_directions,
+                                 ssm_backend=ssm_backend)
 
     def forward(self, point):
         oi = self.order_index % point.serialized_order.shape[0]
@@ -252,7 +259,7 @@ class Block(PointModule):
     def __init__(self, channels, mamba_state_dim, mamba_conv_dim, mamba_expand_factor,
                  mlp_ratio=3.0, proj_drop=0.0, drop_path=0.0, norm_layer=nn.LayerNorm,
                  act_layer=nn.GELU, pre_norm=True, order_index=0, cpe_indice_key=None,
-                 n_directions=2, ssm_backend="auto"):
+                 n_directions=2, ssm_backend="auto", mixer="mamba1"):
         super().__init__()
         self.channels = channels
         self.pre_norm = pre_norm
@@ -265,7 +272,8 @@ class Block(PointModule):
         self.norm1 = PointSequential(RMSNorm(channels))      # pre-Mamba: RMSNorm (MEEPO)
         self.mixer = SerializedMamba(channels, mamba_state_dim, mamba_conv_dim,
                                      mamba_expand_factor, order_index=order_index,
-                                     n_directions=n_directions, ssm_backend=ssm_backend)
+                                     n_directions=n_directions, ssm_backend=ssm_backend,
+                                     mixer=mixer)
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
             MLP(in_channels=channels, hidden_channels=int(channels * mlp_ratio),
@@ -478,6 +486,7 @@ class Meepo(PointModule):
         stem_kernel_size=5,
         n_directions=2,
         ssm_backend="auto",
+        mixer="mamba1",              # "mamba1" (MEEPO reference) or "mamba3" (MEEPO-3, meepo3.py)
         norm="ln",          # MEEPO is LayerNorm/RMSNorm based (no BatchNorm) -> micro-batch safe
     ):
         super().__init__()
@@ -497,7 +506,7 @@ class Meepo(PointModule):
         block_kw = dict(mamba_state_dim=mamba_state_dim, mamba_conv_dim=mamba_conv_dim,
                         mamba_expand_factor=mamba_expand_factor, mlp_ratio=mlp_ratio,
                         proj_drop=proj_drop, norm_layer=norm_layer, act_layer=act_layer,
-                        pre_norm=pre_norm, n_directions=n_directions, ssm_backend=ssm_backend)
+                        pre_norm=pre_norm, n_directions=n_directions, ssm_backend=ssm_backend, mixer=mixer)
 
         enc_dp = [x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))]
         self.enc = PointSequential()

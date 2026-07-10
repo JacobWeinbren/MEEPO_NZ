@@ -93,7 +93,7 @@ def main():
     m = ((xyz[:, 0] >= cx - h) & (xyz[:, 0] < cx + h) &
          (xyz[:, 1] >= cy - h) & (xyz[:, 1] < cy + h))
     sub = np.where(m)[0]
-    if sub.size < int(cfg.sphere_min_points):
+    if sub.size < int(getattr(cfg, 'tile_stats_min_points', 100)):
         sys.exit(f"window has too few points ({sub.size}); widen --window or move --center")
     wx = xyz[sub]; wnr = num_returns[sub]; wrn = return_number[sub]; wint = intensity[sub]
 

@@ -158,8 +158,6 @@ def main():
                     help="Force the subsampling grid size in metres (overrides --auto-dl), e.g. --dl 0.1.")
     ap.add_argument("--workers", type=int, default=None,
                     help="Parallel worker processes (default: all CPU cores).")
-    ap.add_argument("--in-radius", type=float, default=None,
-                    help="Sphere/cylinder radius in m (sphere mode). Bakes the candidate cylinders, e.g. --in-radius 8.")
     ap.add_argument("--min-dtm-coverage", type=float, default=None,
                     help="Drop tiles whose sphere centres are <this fraction covered by the "
                          "previous-year DTM (e.g. 0.9). Guarantees prev-DTM overlap. Default: keep all.")
@@ -168,8 +166,6 @@ def main():
     cfg = Config.load(args.config) if args.config else Config()
     if args.min_dtm_coverage is not None:
         cfg.min_dtm_coverage = float(args.min_dtm_coverage)
-    if args.in_radius is not None:
-        cfg.in_radius = float(args.in_radius); cfg.auto_in_radius = False
     if not args.root and not args.input_dir:
         ap.error("provide --root (with a manifest.json from stage 01/02) or --input-dir <folder>")
     out_dir = args.out or (os.path.join(args.root, "tiles") if args.root else None)
@@ -286,62 +282,3 @@ def main():
 
     # size the input cylinder to the conv reach (auto_in_radius) now that dl is final
     cfg.resolve_geometry()
-    if getattr(cfg, "auto_in_radius", False):
-        print(f"[04] auto in_radius = {cfg.in_radius:.2f} m "
-              f"(conv_radius {cfg.conv_radius} x dl {cfg.first_subsampling_dl} x 2^4; "
-              f"sphere_center_spacing = {cfg.sphere_center_spacing:.2f} m)")
-
-    # split is assigned PER CLOUD (so overlapping tiles never leak across splits)
-    splits = _assign_splits(len(jobs), cfg, cfg.seed)
-
-    # one task per CLOUD, kept in pair order so a worker sees same-raster clouds
-    # back-to-back (its raster cache then reloads only on a pair boundary). This
-    # uses every core, instead of one worker grinding a whole pair serially.
-    tasks = [(cloud, prior_path, dtm_path, str(splits[i]), out_dir, cfg, int(cfg.seed) + i)
-             for i, (cloud, prior_path, dtm_path, pid) in enumerate(jobs)]
-
-    total = 0
-    per_split = {"train": 0, "val": 0, "test": 0}
-    n_workers = max(int(args.workers) if args.workers else (os.cpu_count() or 4), 1)
-    n_workers = min(n_workers, len(tasks)) if tasks else 1
-    # Cap for memory: each worker holds the cloud's point arrays + a KD-tree + the
-    # cylinder-index buffers (~1-3 GB). The per-cloud DTM raster is now tiny (a few MB,
-    # built from the spatial twin in stage 02), so it is NO LONGER the limiter - the old
-    # giant per-pair raster that forced this cap is gone, so raise --workers freely.
-    MEM_SAFE_WORKERS = 32
-    if n_workers > MEM_SAFE_WORKERS:
-        print(f"[04] capping workers {n_workers} -> {MEM_SAFE_WORKERS} (per-cloud memory: cloud "
-              f"arrays + DTM raster + cylinder indices). Pass --workers <= {MEM_SAFE_WORKERS}; "
-              f"lower it further if you still hit an OOM / BrokenProcessPool.")
-        n_workers = MEM_SAFE_WORKERS
-    n_clouds = len(jobs)
-    # contiguous chunks so a worker sees same-raster (same-pair) clouds back-to-back
-    # -> the size-1 raster cache reloads only at pair boundaries, not every cloud.
-    chunk = max(1, len(tasks) // (n_workers * 8)) if tasks else 1
-    print(f"[04] preprocessing {n_clouds} clouds (one task each) "
-          f"with {n_workers} workers (chunksize={chunk}) ...")
-    import concurrent.futures as _cf
-    import multiprocessing as _mp
-    done = 0
-    with _cf.ProcessPoolExecutor(max_workers=n_workers,
-                                 mp_context=_mp.get_context("spawn")) as ex:
-        for name, split, n, had_dtm, missing in ex.map(_preprocess_one, tasks, chunksize=chunk):
-            done += 1
-            if missing:
-                print(f"[04] missing (run 01 first): {name}", flush=True)
-                continue
-            total += n
-            per_split[split] += n
-            print(f"[04] [{done}/{n_clouds}] {name} "
-                  f"split={split} prior={'yes' if had_dtm else 'no'} -> {n} tiles", flush=True)
-
-    print(f"[04] wrote {total} tiles  (train={per_split['train']} "
-          f"val={per_split['val']} test={per_split['test']}) to {out_dir}")
-
-    stats = compute_norm_stats(out_dir, cfg)
-    print(f"[04] norm_stats.json: {stats['n_features']} channels over "
-          f"{stats['n_points']:,} points")
-
-
-if __name__ == "__main__":
-    main()

@@ -48,6 +48,17 @@ off-by-default ablation via `--height-aware-loss`.)
 
 **Backbone choice.** `backbone=point_moe` (default) is PTv3 + MoE (MEEPO-L, ~100M). `backbone=litept` swaps in a **LitePT** backbone (sparse-conv early stages, PointROPE rotary attention in the deep stages) with the same Proj-MoE — lighter and more rotation/transfer-friendly. A/B them on the same pipeline: `--backbone litept`.
 
+**`--backbone vm3` (VoxelMamba-3, recommended for Mamba-3).** A group-free,
+whole-scene Mamba-3 U-Net that replaces the MEEPO-3 retrofit: the OFFICIAL
+multi-head Mamba-3 mixer (native anatomy: d_state 64, headdim 64, per-head
+everything, whole-scene cumulative RoPE, packed varlen `cu_seqlens`) inside a
+Voxel-Mamba-style host (dual-scale fwd/bwd branches, implicit window
+embeddings) with UniMamba-style conv locality outside the mixer. 60.7M params
+by default. Requires the official mamba package on GPU (Triton JIT; see
+`VM3.md`). Not `--init-from` compatible with the other backbones. Full design,
+provenance, flags and the smoke gate: **`VM3.md`**; smoke:
+`PYTHONPATH=. python3 scripts/smoke_vm3.py`.
+
 ---
 
 ## Install (Blackwell or any CUDA box)

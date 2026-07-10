@@ -35,7 +35,7 @@ class MeepoSeg(nn.Module):
         # raster branch (Deviation A) is now integrated into the whole-scene pipeline too:
         # in scene mode the prior raster is cropped per block and run through this same CNN.
         self.use_raster = bool(getattr(cfg, "use_dtm_raster", True))
-        self.in_radius = float(getattr(cfg, "in_radius", 5.0))
+        self._raster_tile_default = float(getattr(cfg, "scene_block_size", 64.0))  # sphere mode removed; raster window falls back to the scene block size
 
         sample_dim = 0
         if self.use_raster:
@@ -54,28 +54,90 @@ class MeepoSeg(nn.Module):
         backbone_in = in_features_dim + sample_dim
         order = tuple(getattr(cfg, "moe_order",
                               ("z", "z-trans", "hilbert", "hilbert-trans")))
-        # MEEPO (CNN-Mamba) backbone -- replaces PTv3/LitePT + MoE. Hyperparameters
+        backbone_kind = str(getattr(cfg, "backbone", "meepo")).lower()
+        if backbone_kind in ("vm3", "voxelmamba3"):
+            # VoxelMamba-3 (models/vm3.py): group-free whole-scene Mamba-3 U-Net.
+            # Official multi-head Mamba-3 mixer (native anatomy) + Voxel Mamba
+            # DSB/IWP + UniMamba SLM-style conv locality. Replaces meepo3.
+            from .vm3 import VoxelMamba3
+            self.backbone = VoxelMamba3(
+                in_channels=backbone_in,
+                order=tuple(getattr(cfg, "vm3_order",
+                                    ("hilbert", "hilbert-trans", "z", "z-trans"))),
+                stride=tuple(getattr(cfg, "vm3_stride", (2, 2, 2))),
+                enc_depths=tuple(getattr(cfg, "vm3_enc_depths", (2, 2, 2, 2))),
+                enc_channels=tuple(getattr(cfg, "vm3_enc_channels", (128, 256, 384, 512))),
+                dec_depths=tuple(getattr(cfg, "vm3_dec_depths", (1, 1, 1))),
+                dec_channels=tuple(getattr(cfg, "vm3_dec_channels", (128, 256, 384))),
+                d_state=int(getattr(cfg, "vm3_state", 64)),
+                headdim=int(getattr(cfg, "vm3_headdim", 64)),
+                expand=int(getattr(cfg, "vm3_expand", 2)),
+                mlp_ratio=float(getattr(cfg, "vm3_mlp_ratio", 3.0)),
+                drop_path=float(getattr(cfg, "vm3_drop_path",
+                                        getattr(cfg, "drop_path_rate", 0.3))),
+                dsb_down=tuple(getattr(cfg, "vm3_dsb_down", (1, 2, 4, 4))),
+                iwe_window=int(getattr(cfg, "vm3_iwe_window", 16)),
+                use_cpe=bool(getattr(cfg, "vm3_use_cpe", True)),
+                decay_bands=bool(getattr(cfg, "vm3_decay_bands", True)),
+                chunk_size=int(getattr(cfg, "vm3_chunk_size", 64)),
+                shuffle_orders=bool(getattr(cfg, "shuffle_orders", True)),
+                stem_kernel_size=int(getattr(cfg, "stem_kernel_size", 5)),
+                ssm_backend=str(getattr(cfg, "ssm_backend", "auto")),
+                grad_checkpointing=bool(getattr(cfg, "grad_checkpointing", False)),
+                checkpoint_granularity=str(getattr(cfg, "checkpoint_granularity", "block")),
+                norm=str(getattr(cfg, "norm", "ln")),
+            )
+        elif backbone_kind == "pointssm":
+            # PointSSM (Li et al., IJAEG 2025) host + Mamba-3 mixer -- see
+            # models/pointssm3.py for full provenance. Dims default to their Table 1.
+            from .pointssm3 import PointSSM3
+            self.backbone = PointSSM3(
+                in_channels=backbone_in,
+                order=tuple(getattr(cfg, "pointssm_order",
+                                    ("hilbert", "hilbert-yzx", "hilbert-zxy"))),
+                stride=tuple(getattr(cfg, "enc_stride", (2, 2, 2, 2))),
+                enc_depths=tuple(getattr(cfg, "pointssm_enc_depths", (1, 1, 2, 4, 1))),
+                enc_channels=tuple(getattr(cfg, "pointssm_enc_channels", (64, 64, 128, 256, 512))),
+                dec_depths=tuple(getattr(cfg, "pointssm_dec_depths", (1, 1, 1, 1))),
+                dec_channels=tuple(getattr(cfg, "pointssm_dec_channels", (64, 64, 128, 256))),
+                d_state=int(getattr(cfg, "pointssm_state", 32)),
+                expand=int(getattr(cfg, "pointssm_expand", 1)),
+                dsamba_state=int(getattr(cfg, "pointssm_dsamba_state", 4)),
+                dsamba_expand=int(getattr(cfg, "pointssm_dsamba_expand", 2)),
+                drop_path=float(getattr(cfg, "pointssm_drop_path", 0.1)),
+                shuffle_orders=bool(getattr(cfg, "shuffle_orders", True)),
+                stem_kernel_size=int(getattr(cfg, "stem_kernel_size", 5)),
+                ssm_backend=str(getattr(cfg, "ssm_backend", "auto")),
+                grad_checkpointing=bool(getattr(cfg, "grad_checkpointing", False)),
+                checkpoint_granularity=str(getattr(cfg, "checkpoint_granularity", "block")),
+                norm=str(getattr(cfg, "norm", "ln")),
+            )
+        else:
+            # MEEPO (CNN-Mamba) backbone -- replaces PTv3/LitePT + MoE. Hyperparameters
         # adopted verbatim from the MEEPO ScanNet config (semseg-meepo.py).
-        self.backbone = Meepo(
-            in_channels=backbone_in, order=order,
-            stride=tuple(getattr(cfg, "enc_stride", (2, 2, 2, 2))),
-            enc_depths=tuple(getattr(cfg, "meepo_enc_depths", (2, 2, 2, 6, 2))),
-            enc_channels=tuple(getattr(cfg, "meepo_enc_channels", (32, 64, 128, 256, 512))),
-            dec_depths=tuple(getattr(cfg, "meepo_dec_depths", (2, 2, 2, 2))),
-            dec_channels=tuple(getattr(cfg, "meepo_dec_channels", (64, 64, 128, 256))),
-            mamba_state_dim=int(getattr(cfg, "mamba_state_dim", 1)),
-            mamba_conv_dim=int(getattr(cfg, "mamba_conv_dim", 4)),
-            mamba_expand_factor=int(getattr(cfg, "mamba_expand_factor", 3)),
-            mlp_ratio=float(getattr(cfg, "mlp_ratio", 3)),
-            drop_path=float(getattr(cfg, "drop_path_rate", 0.3)),
-            shuffle_orders=bool(getattr(cfg, "shuffle_orders", True)),
-            stem_kernel_size=int(getattr(cfg, "stem_kernel_size", 5)),
-            n_directions=int(getattr(cfg, "mamba_directions", 2)),
-            ssm_backend=str(getattr(cfg, "ssm_backend", "auto")),
-            grad_checkpointing=bool(getattr(cfg, "grad_checkpointing", False)),
-            checkpoint_granularity=str(getattr(cfg, "checkpoint_granularity", "block")),
-            norm=str(getattr(cfg, "norm", "ln")),
-        )
+            self.backbone = Meepo(
+                in_channels=backbone_in, order=order,
+                stride=tuple(getattr(cfg, "enc_stride", (2, 2, 2, 2))),
+                enc_depths=tuple(getattr(cfg, "meepo_enc_depths", (2, 2, 2, 6, 2))),
+                enc_channels=tuple(getattr(cfg, "meepo_enc_channels", (32, 64, 128, 256, 512))),
+                dec_depths=tuple(getattr(cfg, "meepo_dec_depths", (2, 2, 2, 2))),
+                dec_channels=tuple(getattr(cfg, "meepo_dec_channels", (64, 64, 128, 256))),
+                mamba_state_dim=(int(getattr(cfg, "meepo3_state", 4))
+                                 if backbone_kind == "meepo3"
+                                 else int(getattr(cfg, "mamba_state_dim", 1))),
+                mamba_conv_dim=int(getattr(cfg, "mamba_conv_dim", 4)),
+                mamba_expand_factor=int(getattr(cfg, "mamba_expand_factor", 3)),
+                mlp_ratio=float(getattr(cfg, "mlp_ratio", 3)),
+                drop_path=float(getattr(cfg, "drop_path_rate", 0.3)),
+                shuffle_orders=bool(getattr(cfg, "shuffle_orders", True)),
+                stem_kernel_size=int(getattr(cfg, "stem_kernel_size", 5)),
+                n_directions=int(getattr(cfg, "mamba_directions", 2)),
+                mixer=("mamba3" if backbone_kind == "meepo3" else "mamba1"),
+                ssm_backend=str(getattr(cfg, "ssm_backend", "auto")),
+                grad_checkpointing=bool(getattr(cfg, "grad_checkpointing", False)),
+                checkpoint_granularity=str(getattr(cfg, "checkpoint_granularity", "block")),
+                norm=str(getattr(cfg, "norm", "ln")),
+            )
         head_drop = float(getattr(cfg, "head_dropout", 0.0))
         self.seg_head = nn.Sequential(
             nn.Dropout(head_drop) if head_drop > 0 else nn.Identity(),
@@ -190,7 +252,7 @@ class MeepoSeg(nn.Module):
             # patch spans [center-T/2, center+T/2]; tile-local coords are centred in
             # [-T/2, T/2] -> shift to [0, T] for the sampler. T defaults to 2*in_radius
             # (sphere mode); callers may pass raster_tile_size for other geometries.
-            tile = float(batch.get("raster_tile_size") or (2.0 * self.in_radius))
+            tile = float(batch.get("raster_tile_size") or self._raster_tile_default)
             xy = coord.clone()
             xy[:, 0] = xy[:, 0] + tile / 2.0
             xy[:, 1] = xy[:, 1] + tile / 2.0

@@ -78,6 +78,53 @@ def _vis_feature_columns(cfg):
     return cols
 
 
+def load_pretrained(model, path, verbose=True):
+    """Weights-only transfer init: load a checkpoint's model weights into ``model``
+    WITHOUT optimizer/scheduler/epoch state (that is what distinguishes transfer
+    fine-tuning from resuming). Accepts trainer checkpoints ({'model_state': ...}) or
+    raw state_dicts; strips 'module.' / '_orig_mod.' wrapper prefixes.
+
+    Shape-mismatched tensors are a hard error with cause guidance (they mean the
+    architectures genuinely differ -- e.g. tiles built with vs without a prior change
+    in_features_dim). Missing/unexpected KEYS are tolerated and reported (e.g. a
+    pretrain without --spag-rl fine-tuned with it: the RL head initialises fresh)."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    sd = ckpt.get("model_state", ckpt) if isinstance(ckpt, dict) else ckpt
+    clean = {}
+    for k, v in sd.items():
+        for pre in ("_orig_mod.", "module."):
+            while k.startswith(pre):
+                k = k[len(pre):]
+        clean[k] = v
+    own = model.state_dict()
+    ok = {k: v for k, v in clean.items() if k in own and own[k].shape == v.shape}
+    bad = [(k, tuple(clean[k].shape), tuple(own[k].shape))
+           for k in clean if k in own and own[k].shape != clean[k].shape]
+    missing = [k for k in own if k not in clean]
+    unexpected = [k for k in clean if k not in own]
+    if bad:
+        lines = "\n".join(f"    {k}: checkpoint{s_} vs model{m}" for k, s_, m in bad[:8])
+        raise SystemExit(
+            f"[init-from] SHAPE MISMATCH on {len(bad)} tensor(s):\n{lines}\n"
+            f"[init-from] The architectures differ. Usual causes: different backbone dims, "
+            f"num_classes, or architecture flags between the pretrain and this run. "
+            f"Pretrain and fine-tune tile sets must share dl and feature layout.")
+    frac = len(ok) / max(len(own), 1)
+    if frac < 0.5:
+        raise SystemExit(f"[init-from] only {100*frac:.0f}% of model tensors found in "
+                         f"{path!r} -- wrong checkpoint?")
+    model.load_state_dict(ok, strict=False)
+    if verbose:
+        print(f"[init-from] loaded {len(ok)}/{len(own)} tensors from {path}"
+              + (f"; fresh-init (missing in ckpt): {len(missing)}" if missing else "")
+              + (f"; ignored (not in model): {len(unexpected)}" if unexpected else ""),
+              flush=True)
+        if missing:
+            heads = sorted({m.split(".")[0] for m in missing})
+            print(f"[init-from]   fresh-init modules: {', '.join(heads[:8])}", flush=True)
+    return model
+
+
 class Trainer:
     def __init__(self, model, cfg, train_set, val_set, collate, vis_set=None,
                  device: Optional[torch.device] = None):
@@ -198,17 +245,29 @@ class Trainer:
             # at the full base LR. The OneCycle multiplier scales all groups proportionally,
             # preserving the ratio throughout.
             blk_kw = str(getattr(cfg, "block_lr_keyword", "block"))
+            # Honor `_no_weight_decay` flags (official Mamba-3 sets them on dt_bias
+            # and D; decaying dt_bias erodes the VM3 local/global decay bands over
+            # long schedules). Split each LR group into decay / no-decay halves;
+            # AdamW's per-group weight_decay overrides the constructor default.
+            def _nd(p):
+                return bool(getattr(p, "_no_weight_decay", False))
+            named = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
             if blk_scale != 1.0:
-                bb = [p for n, p in self.model.named_parameters()
-                      if p.requires_grad and blk_kw in n]
-                rest = [p for n, p in self.model.named_parameters()
-                        if p.requires_grad and blk_kw not in n]
-                param_groups = [
-                    {"params": rest, "lr": base_lr},
-                    {"params": bb, "lr": base_lr * blk_scale},
+                spec = [
+                    ([p for n, p in named if blk_kw not in n and not _nd(p)], base_lr, wd),
+                    ([p for n, p in named if blk_kw not in n and _nd(p)], base_lr, 0.0),
+                    ([p for n, p in named if blk_kw in n and not _nd(p)], base_lr * blk_scale, wd),
+                    ([p for n, p in named if blk_kw in n and _nd(p)], base_lr * blk_scale, 0.0),
                 ]
             else:
-                param_groups = self.model.parameters()
+                spec = [
+                    ([p for n, p in named if not _nd(p)], base_lr, wd),
+                    ([p for n, p in named if _nd(p)], base_lr, 0.0),
+                ]
+            spec = [(ps, lr, w) for ps, lr, w in spec if len(ps) > 0]
+            param_groups = [{"params": ps, "lr": lr, "weight_decay": w} for ps, lr, w in spec]
+            self._group_lrs = [lr for _, lr, _ in spec]
+            _n_nd = sum(len(ps) for ps, _, w in spec if w == 0.0)
             self.optimizer = torch.optim.AdamW(
                 param_groups, lr=base_lr, betas=betas,
                 eps=float(getattr(cfg, "adamw_eps", 1e-8)),
@@ -216,7 +275,8 @@ class Trainer:
             )
             print(f"[opt] AdamW lr={base_lr:.1e} betas={betas} wd={wd:.2e}"
                   f"{' fused' if _fused else ''}"
-                  f"{f' | {blk_kw!r}-param lr x{blk_scale:g}' if blk_scale != 1.0 else ''}")
+                  f"{f' | {blk_kw!r}-param lr x{blk_scale:g}' if blk_scale != 1.0 else ''}"
+                  f" | no-decay params: {_n_nd}")
         else:
             base_lr = float(cfg.learning_rate)
             self.optimizer = torch.optim.SGD(
@@ -253,7 +313,8 @@ class Trainer:
             self.scheduler = None
             self._onecycle_pmoe = True
             blk = float(getattr(cfg, "block_lr_scale", 0.3))
-            self._oc_max_lr = [base_lr, base_lr * blk] if blk != 1.0 else base_lr
+            self._oc_max_lr = getattr(self, "_group_lrs", None) \
+                or ([base_lr, base_lr * blk] if blk != 1.0 else base_lr)
             print(f"[opt] MEEPO OneCycleLR max_lr={self._oc_max_lr} "
                   f"pct_start={float(getattr(cfg,'onecycle_pct_start',0.05)):g} "
                   f"div={float(getattr(cfg,'onecycle_div_factor',10.0)):g} "
@@ -429,7 +490,7 @@ class Trainer:
             )
 
         # ---- KPConv variable batch size (total-points budget; paper-faithful) ----
-        if bool(getattr(self.cfg, "variable_batch", False)):
+        if False:  # variable batching removed with sphere mode
             return self._variable_loaders(bs, nsamp, sampler, common)
 
         train_loader = DataLoader(
@@ -954,7 +1015,7 @@ class Trainer:
         ``max_tiles=None`` scores the WHOLE split at FULL coverage (whole tiles) -- the
         final test, our analogue of KPConv's vote-until-covered pass.
         """
-        from ..inference.voting import predict_cloud_spheres
+        from ..inference.voting import predict_scene
         self.model.eval()
         cfg = self.cfg
         conf = ConfusionAccumulator()
@@ -996,10 +1057,9 @@ class Trainer:
                     pts = pts[sel]; labels = labels[sel]; ret = ret[sel]
                     inten = None if inten is None else np.asarray(inten)[sel]
                     rr = None if rr is None else np.asarray(rr)[sel]
-                out = predict_cloud_spheres(
+                out = predict_scene(
                     pts, ret[:, 0], ret[:, 1], cfg, self.model, self.device,
-                    mean=mean, std=std, prev_dtm=c.get("prior", c.get("dtm")),
-                    neighbor_limit=nl, intensity=inten, ret_ratio=rr,
+                    mean=mean, std=std, prev_dtm=c.get("prior", c.get("dtm")), intensity=inten, ret_ratio=rr,
                     return_proba=True, return_precleanup=True,
                     tta=bool(getattr(cfg, "tta", False)) and full_cover)
                 # (pred=refined, proba, pred_raw=pre-refine argmax)
@@ -1094,9 +1154,7 @@ class Trainer:
         legible at scene scale than a single 16 m input sphere. Set
         ``vis_full_area=False`` to fall back to the per-sphere renderer. Each item
         is wrapped so a failure skips that panel without affecting training."""
-        if not bool(getattr(self.cfg, "vis_full_area", True)):
-            return self._per_epoch_vis_spheres(ep_dir, epoch)
-        from ..inference.voting import predict_cloud_spheres
+        from ..inference.voting import predict_scene
         self.model.eval()
         cfg = self.cfg
         n_vis = min(cfg.n_vis_tiles, len(self.vis_set))
@@ -1106,12 +1164,8 @@ class Trainer:
         std = getattr(self.vis_set, "std", None)
         # Gallery voting can use a coarser sphere spacing than training (the relief is
         # rendered at ~1 m/px), cutting the per-epoch vis cost ~(spacing ratio)^2 with no
-        # visible change. Override sphere_center_spacing for the loop, then restore. (No
+        # (sphere-mode spacing override removed with sphere mode. No
         # effect in scene mode, which renders via PTv3-native one-forward-per-block.)
-        _spacing_saved = float(getattr(cfg, "sphere_center_spacing", 5.0))
-        _vis_spacing = float(getattr(cfg, "vis_sphere_spacing", 0.0) or 0.0)
-        if _vis_spacing > 0:
-            cfg.sphere_center_spacing = max(_vis_spacing, _spacing_saved)
         rendered = 0
         for i in range(len(self.vis_set)):
             if rendered >= n_vis:
@@ -1123,13 +1177,13 @@ class Trainer:
                 center = np.asarray(center, dtype=np.float64)
                 d = pts[:, :2].astype(np.float64) - center[:2]
                 m = (np.abs(d[:, 0]) <= half) & (np.abs(d[:, 1]) <= half)
-                if int(m.sum()) < int(cfg.sphere_min_points):
+                if int(m.sum()) < int(getattr(cfg, 'scene_min_points', 100)):
                     continue
                 wp = pts[m].astype(np.float32)
                 ret = c["returns"][m]
-                pred, pred_raw = predict_cloud_spheres(
+                pred, pred_raw = predict_scene(
                     wp, ret[:, 0], ret[:, 1], cfg, self.model, self.device,
-                    mean=mean, std=std, prev_dtm=c.get("prior", c.get("dtm")), neighbor_limit=nl,
+                    mean=mean, std=std, prev_dtm=c.get("prior", c.get("dtm")),
                     intensity=c["intensity"][m], ret_ratio=c["ret_ratio"][m],
                     return_precleanup=True)
                 world = wp.astype(np.float64) + origin[None, :]
@@ -1178,55 +1232,9 @@ class Trainer:
                 rendered += 1
             except Exception as e:
                 print(f"  [warn] area gallery item {i} skipped: {e}")
-        cfg.sphere_center_spacing = _spacing_saved      # restore training spacing
         self.model.train()
 
-    @torch.no_grad()
-    def _per_epoch_vis_spheres(self, ep_dir: str, epoch: int):
-        self.model.eval()
-        n_vis = min(self.cfg.n_vis_tiles, len(self.vis_set))
-        rendered = 0
-        for i in range(len(self.vis_set)):
-            if rendered >= n_vis:
-                break
-            sample = self.vis_set[i]
-            batch = self.collate([sample])
-            batch = move_batch(batch, self.device, self.cfg)
-            with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                logits = self.model(batch)
-            pred = logits.argmax(dim=1).cpu().numpy()
 
-            lengths0 = batch["lengths"][0]
-            local_pc = _per_cloud(batch["points"][0], lengths0)[0]
-            labels_pc = batch["labels"].cpu().numpy()
-            origin = sample["origin"]
-            world = local_pc.astype(np.float64) + origin[None, :]
-
-            base = os.path.splitext(os.path.basename(sample["path"]))[0]
-            # per-point inputs for the combined panel (the sample carries raw cues)
-            feats = {}
-            for src, dst in (("num_returns", "return_count"), ("ret_ratio", "return_ratio"),
-                             ("intensity", "intensity")):
-                v = sample.get(src)
-                if v is not None and np.asarray(v).reshape(-1).shape[0] == world.shape[0]:
-                    feats[dst] = np.asarray(v, dtype=np.float32).reshape(-1)
-            if self.cfg.render_errors_every_epoch:
-                try:
-                    render_scene_report(
-                        world, labels_pc, pred,
-                        os.path.join(ep_dir, f"scene_{base}.png"),
-                        feats=feats, title=f"MEEPO  (epoch {epoch})  {base}")
-                except Exception as e:
-                    print(f"  [warn] scene report render skipped for {base}: {e}")
-            if self.cfg.write_laz_every_epoch:
-                try:
-                    write_classified(os.path.join(ep_dir, f"scene_{base}.laz"), world, pred)
-                except Exception as e:
-                    print(f"  [warn] LAZ write skipped for {base}: {e}")
-            rendered += 1
-        self.model.train()
-
-    # ---------------------------------------------------------------- io utils
     def _save_checkpoint(self, path: str, epoch: int, metrics: Dict):
         torch.save({
             "epoch": epoch,

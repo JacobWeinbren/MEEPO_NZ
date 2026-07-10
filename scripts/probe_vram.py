@@ -73,6 +73,9 @@ def main():
     ap.add_argument("--dl", type=float, default=None)
     ap.add_argument("--iters", type=int, default=3, help="steps per config; peak taken over all")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--backbone", default=None, choices=["meepo", "meepo3", "pointssm", "vm3"],
+                    help="Probe a specific backbone (default: cfg default).")
+    ap.add_argument("--ssm-backend", default=None, choices=["auto", "cuda", "ssd", "torch"])
     args = ap.parse_args()
 
     device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
@@ -89,6 +92,10 @@ def main():
         use_real = False
     cfg.scene_mode = True
     cfg.spag_learned = False                                      # isolate the backbone cost
+    if args.backbone is not None:
+        cfg.backbone = args.backbone
+    if args.ssm_backend is not None:
+        cfg.ssm_backend = args.ssm_backend
     if args.dl is not None:
         cfg.first_subsampling_dl = float(args.dl)
     from meepo_nz.features.shallow_features import expected_feature_dim
