@@ -97,3 +97,18 @@ IWE, and the Hilbert/Z complementary orders.
   freeze the seed for that dataset. Implemented in `data/splitting.py`.
 * `probe_vram.py` accepts `--backbone vm3 --ssm-backend cuda` so the 16 GB
   feasibility probe exercises the real VM3 stack.
+
+## r4 changes (2026-07-10)
+
+* FIX: vendored `mamba3_siso_combined.py` backward read `ctx.saved_tensors`
+  twice (a `len()` guard + the real unpack), which is illegal under
+  non-reentrant `torch.utils.checkpoint` and raised "Unpack is being triggered
+  for a tensor that was already unpacked once" whenever VM3 trained WITH grad
+  checkpointing on the official kernels (e.g. 16 GB cards with
+  `--checkpoint-granularity block`). Now reads it exactly once. Candidate for
+  an upstream PR to state-spaces/mamba.
+* smoke_vm3 gained check [7]: forward+backward through the block-granularity
+  grad-checkpointing path.
+* Windows note: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is a
+  Linux-only allocator feature; on Windows it emits a UserWarning and does
+  nothing — omit it there.

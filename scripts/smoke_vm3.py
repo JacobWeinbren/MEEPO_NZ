@@ -160,6 +160,19 @@ def main():
     n_par = model.num_parameters()
     ok(6, f"MeepoSeg(vm3) end-to-end: logits (700, 2), params={n_par:,}")
 
+    # [7] grad-checkpointing path (block granularity) -----------------------
+    net_ck = VoxelMamba3(in_channels=6, **{**TINY, "grad_checkpointing": True,
+                                           "checkpoint_granularity": "block"})
+    net_ck.train()
+    out7 = net_ck(Point(_point([500, 400])))
+    loss7 = out7.feat.square().mean()
+    loss7.backward()
+    bad = [n for n, p in net_ck.named_parameters()
+           if p.grad is not None and not torch.isfinite(p.grad).all()]
+    assert not bad, f"non-finite grads under checkpointing: {bad[:5]}"
+    n_grads = sum(1 for p in net_ck.parameters() if p.grad is not None)
+    ok(7, f"grad-checkpointing (block): backward OK, {n_grads} params received grads")
+
     print("[smoke-vm3] ALL OK — safe to spend GPU time. "
           "(On the GPU box the mixer should report 'mamba3-official'; "
           "this CPU run used the torch reference.)")
