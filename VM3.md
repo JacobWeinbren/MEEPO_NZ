@@ -137,3 +137,14 @@ IWE, and the Hilbert/Z complementary orders.
   project folder by design), and hard errors instead of silent no-ops.
   Verified end-to-end on synthetic EA-convention LAS (class 1 = non-ground
   via `--unclassified-classes 0`) through 04 and the label audit.
+
+## r7 changes (2026-07-10)
+
+* SubMConv3d (clean-PyTorch path): when the neighbour gather (N, K3, C) is
+  large, the whole gather+GEMM is now wrapped in non-reentrant checkpoint --
+  tiling bounded only the forward transient; autograd still saved every
+  tile's GEMM input. Recomputed in backward instead: bit-identical outputs
+  and grads (verified), ~one extra conv forward per backward.
+  POINT_MOE_CONV_CKPT=0 disables. Note the SSD scan already ships group-level
+  checkpointing (POINT_MOE_SSD_CKPT=1 default) -- the 'level below layer'
+  now covers both of the model's largest saved tensors.
