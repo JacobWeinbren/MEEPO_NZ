@@ -523,7 +523,13 @@ class Trainer:
                   f"plus single-threaded pin_memory, make it slower AND the prefetch buffer "
                   f"can exhaust RAM (an OOM kill). Pass --num-workers <= {NW_CAP}.", flush=True)
             nw = NW_CAP
-        pin = self.device.type == "cuda"
+        # POINT_MOE_PIN_MEMORY=0 disables DataLoader pinning. At ~512k-point scenes
+        # each prefetched multiscale batch is GB-scale; pinned staging is GPU-mapped
+        # under WDDM and can fill the ENTIRE shared-GPU budget (observed 30/31.6 GB),
+        # thrashing the machine before step 1. Unpinned = pageable H2D (slower copy,
+        # but copies are a tiny fraction of these step times).
+        import os as _os
+        pin = self.device.type == "cuda" and _os.environ.get("POINT_MOE_PIN_MEMORY", "1") != "0"
         common = dict(collate_fn=self.collate, num_workers=nw, pin_memory=pin)
         if nw > 0:
             # persistent_workers OFF by default: workers are torn down each epoch, which

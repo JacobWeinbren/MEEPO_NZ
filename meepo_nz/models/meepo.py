@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import math
 import os
+import os
 from collections import OrderedDict
 from functools import partial
 
@@ -174,8 +175,15 @@ class BiMamba(nn.Module):
         x, z = xz.chunk(2, dim=1)                            # each (B, half, L)
 
         ys, zs = [], []
+        use_dir_ckpt = (torch.is_grad_enabled() and x.requires_grad
+                        and L > int(os.environ.get("POINT_MOE_DIR_CKPT_MIN_L", "32768"))
+                        and os.environ.get("POINT_MOE_DIR_CKPT", "0") == "1")
         for i in range(self.n_directions):
-            yi, zi = self._direction(x, z, torch.tensor(i))
+            if use_dir_ckpt:
+                from torch.utils.checkpoint import checkpoint as _ckpt
+                yi, zi = _ckpt(self._direction, x, z, torch.tensor(i), use_reentrant=False)
+            else:
+                yi, zi = self._direction(x, z, torch.tensor(i))
             ys.append(yi)
             zs.append(zi)
 
@@ -216,7 +224,19 @@ class BiMamba(nn.Module):
                                       delta_softplus=True, backend=self.ssm_backend,
                                       h0=h_in, return_last_state=True)
 
-            yi, _ = _proj_scan(xi, None)                                                 # (B,half,L)
+            slice_len = int(os.environ.get("POINT_MOE_SEQ_SLICE", "0"))
+            if slice_len > 0 and L > slice_len and torch.is_grad_enabled() and xi.requires_grad:
+                from torch.utils.checkpoint import checkpoint as _ckpt
+                h = xi.new_zeros((B, self.half, self.d_state), dtype=torch.float32)
+                y_parts = []
+                for s0 in range(0, L, slice_len):
+                    e0 = min(s0 + slice_len, L)
+                    y_s, h = _ckpt(_proj_scan, xi[:, :, s0:e0].contiguous(), h,
+                                   use_reentrant=False)
+                    y_parts.append(y_s)
+                yi = torch.cat(y_parts, dim=-1)                                              # (B,half,L)
+            else:
+                yi, _ = _proj_scan(xi, None)                                                 # (B,half,L)
 
             if i == 1:
                 yi, zi = yi.flip(-1), zi.flip(-1)

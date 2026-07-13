@@ -218,3 +218,16 @@ IWE, and the Hilbert/Z complementary orders.
 * POINT_MOE_OFFLOAD_PIN=0 disables pinned staging in --offload-activations
   (variable shapes can also grow the cached PINNED HOST pool; unpinned is
   slower to transfer but cannot ratchet).
+
+## r14 changes (2026-07-11) -- 512k-on-16GB rescue set
+
+* POINT_MOE_PIN_MEMORY=0: disables DataLoader pinning. At 512k scenes the
+  prefetched multiscale batches are GB-scale; pinned staging is GPU-mapped
+  under WDDM and observed filling the entire 31.6 GB shared budget.
+* The exact transient-shrinkers return as OPT-IN env gates (default OFF =
+  original meepo): POINT_MOE_SEQ_SLICE=<tokens> (checkpointed sequence slices
+  with exact state carry) and POINT_MOE_DIR_CKPT=1 (per-direction recompute).
+  Re-verified sliced+dir-ckpt == plain to 4.7e-10 across outputs and grads.
+  Rationale: --offload-activations moves SAVED tensors to RAM but cannot
+  shrink the per-segment on-device TRANSIENT (observed pk=18.7 GB on a dense
+  512k tile, over the 16 GB ceiling); these gates cut the transient itself.
