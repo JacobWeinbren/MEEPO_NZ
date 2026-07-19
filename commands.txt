@@ -1,21 +1,17 @@
 cd C:\Users\jweinbren\Downloads\MEEPO-main
 pip install --no-deps -e .
 
-set POINT_MOE_SSD_COMPILE=
-set POINT_MOE_EMPTY_CACHE_EVERY=1
-set POINT_MOE_OFFLOAD_PIN=0
-set POINT_MOE_PIN_MEMORY=0
-set POINT_MOE_SEQ_SLICE=65536
-set POINT_MOE_DIR_CKPT=1
-set POINT_MOE_SSD_CHUNK=32
-set PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256,garbage_collection_threshold:0.8,roundup_power2_divisions:4
+set POINT_MOE_SEQ_SLICE=
+set POINT_MOE_DIR_CKPT=
+set POINT_MOE_SSD_CHUNK=
+set POINT_MOE_EMPTY_CACHE_EVERY=
+set POINT_MOE_PIN_MEMORY=1
+set PYTORCH_CUDA_ALLOC_CONF=
 
 python scripts\05_train.py --tiles data\official\tiles --scene-mode --backbone meepo --dl 0.1 ^
-  --scene-max-points 512000 --batch-num 1 --accum-steps 12 --num-workers 12 ^
+  --scene-max-points 204800 --batch-num 2 --accum-steps 6 --num-workers 6 ^
   --epochs 50 --epoch-steps 232 --lr 0.002 --weight-decay 0.005 --lr-schedule cosine --warmup-epochs 2 ^
-  --resplit-seed 42 --mamba-directions 4 --offload-activations ^
-  --scene-val-tiles 16 --n-vis-tiles 6 ^
-  --refine spag_dc --spag-learned --spag-rl --spag-rl-every 20 --spag-rl-max-points 30000 ^
-  --spag-rl-reward rmse --spag-rl-eval-every 200 --spag-rl-eval-tiles 12 ^
-  --no-augment-tilt --no-augment-elastic --no-dropout --checkpoint-granularity layer ^
-  --tta --device cuda --out-dir runs --name official_meepo_500k_v10 --log-every 5 --scene-vote-step 50
+  --resplit-seed 42 --mamba-directions 4 --checkpoint-granularity block ^
+  --scene-val-tiles 8 --n-vis-tiles 3 --refine off ^
+  --no-augment-tilt --no-augment-elastic --no-dropout ^
+  --device cuda --out-dir runs --name official_meepo_v11_baseline --log-every 5
